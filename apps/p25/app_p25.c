@@ -35,21 +35,45 @@ int dsd_bch_fail_counter = 0;
 volatile int rtl_gain_request = -1;
 
 static const char *TAG = "p25";
-static volatile bool s_app_active = false;
-static volatile bool s_rx_running = false;
+
+/* Lifecycle flags. The handshake is:
+ *   on_enter:
+ *     - clear all three flags, allocate buffers, spawn rx task
+ *     - rx task spawns dsd task; both set their *_running flags
+ *   on_exit:
+ *     - set s_app_active = false (signal both tasks to drain)
+ *     - spin until both *_running flags clear
+ *     - the rx task itself frees the IQ buffer and joins the dsd task
+ *
+ * We deliberately do NOT NULL rtldev here. The device handle is owned
+ * by the radio framework (rtlsdr_dev.c); apps fetch via rtlsdr_dev_get()
+ * at on_enter and otherwise leave it alone. NULLing it from on_exit
+ * was racing the dsd task's tail-end logging on the previous version. */
+static volatile bool s_app_active  = false;
+static volatile bool s_rx_running  = false;
 static volatile bool s_dsd_running = false;
-static uint8_t *s_iq_buf = NULL;
+static uint8_t      *s_iq_buf      = NULL;
 
 void sys_log(uint8_t color, const char *fmt, ...)
 {
     event_t e = { .kind = EVT_LOG, .ts_us = esp_timer_get_time() };
     strncpy(e.app, "P25", EVT_APP_NAME_MAX);
+    /* Map P25's color codes to ESP-IDF log levels. The previous mapping
+     * sent color=1 (the most common, used by sys_log(1, ...) for routine
+     * INFO lines) to level=0 = ESP_LOG_NONE, which made ESP_LOG_LEVEL()
+     * silently discard them. That's why P25 log activity wasn't reaching
+     * the TUI log page or the diag UART even though sys_log was being
+     * called constantly.
+     *
+     *   color 0 / 1 -> INFO   (routine status, sync, voice, tune)
+     *   color 2     -> INFO   (kept INFO; was historically green)
+     *   color 3     -> WARN   (something unusual)
+     *   color 4     -> ERROR  (alloc failure, USB error) */
     int level;
     switch (color) {
-        case 4:  level = 3; break;
-        case 3:  level = 2; break;
-        case 2:  level = 1; break;
-        default: level = 0; break;
+        case 4:  level = 1; break;   /* ESP_LOG_ERROR */
+        case 3:  level = 2; break;   /* ESP_LOG_WARN  */
+        default: level = 3; break;   /* ESP_LOG_INFO  */
     }
     e.u.log.level = level;
     strncpy(e.u.log.tag, "p25", sizeof(e.u.log.tag) - 1);
@@ -137,15 +161,42 @@ static void dsd_decoder_task(void *arg)
 
             if (s_dsd_state.pcm_out_write > 0) {
                 P25.dsd_voice_count++;
+                P25.voice_active_until_us = esp_timer_get_time() + 500000LL;
                 int n = s_dsd_state.pcm_out_write;
                 if (n > s_dsd_state.pcm_out_size) n = s_dsd_state.pcm_out_size;
                 if (!audio_is_muted()) {
                     audio_write_p25_voice(pcm_buf, n);
-                    sys_log(2, "VOX %d smp errs=%u", n, s_dsd_state.debug_audio_errors);
+                    /* Rate-limit: voice frames fire ~50/sec when active.
+                     * Log every 50th one (= roughly 1/sec) so the log
+                     * page stays readable. The TUI MAIN page already
+                     * shows voice count + active indicator at refresh
+                     * rate, so per-frame logging is overkill. */
+                    static unsigned vox_count = 0;
+                    if ((++vox_count % 50) == 0) {
+                        sys_log(0, "VOX active +50 frames errs=%u",
+                                s_dsd_state.debug_audio_errors);
+                    }
                 }
             }
-            sys_log(1, "SYNC %s nac=%04X tg=%d %s",
-                    P25.dsd_modulation, P25.dsd_nac, P25.dsd_tg, P25.dsd_fsubtype);
+            /* Rate-limit: SYNC fires per-frame (~30/sec when locked).
+             * Only log when something CHANGES (NAC, TG, or fsubtype) so
+             * the log shows interesting events instead of a wall of
+             * identical lines. */
+            {
+                static int prev_nac = -1, prev_tg = -1;
+                static char prev_subtype[16] = {0};
+                if (P25.dsd_nac != prev_nac ||
+                    P25.dsd_tg  != prev_tg  ||
+                    strncmp(prev_subtype, P25.dsd_fsubtype, sizeof(prev_subtype)) != 0) {
+                    sys_log(0, "SYNC %s nac=%04X tg=%d %s",
+                            P25.dsd_modulation, P25.dsd_nac,
+                            P25.dsd_tg, P25.dsd_fsubtype);
+                    prev_nac = P25.dsd_nac;
+                    prev_tg  = P25.dsd_tg;
+                    strncpy(prev_subtype, P25.dsd_fsubtype, sizeof(prev_subtype) - 1);
+                    prev_subtype[sizeof(prev_subtype) - 1] = 0;
+                }
+            }
         } else {
             P25.dsd_has_sync = false;
             extern int dsp_has_signal_lock;
@@ -159,6 +210,11 @@ static void dsd_decoder_task(void *arg)
 
 static void p25_rx_task(void *arg)
 {
+    /* Snapshot the device pointer at task start. We don't touch the
+     * extern global rtldev again from the worker thread - the framework
+     * owns its lifetime. */
+    rtlsdr_dev_t *dev = rtldev;
+
     dsp_init(&s_dsp);
     dsp_set_mode(&s_dsp, DEMOD_C4FM);
     dsp_set_gain(&s_dsp, P25.demod_gain);
@@ -167,7 +223,12 @@ static void p25_rx_task(void *arg)
     P25.ring_size = DSD_SAMPLE_RING_SIZE;
 
     s_iq_buf = malloc(P25_USB_BUF_LENGTH);
-    if (!s_iq_buf) { sys_log(4, "OOM rx buffer"); vTaskDelete(NULL); return; }
+    if (!s_iq_buf) {
+        sys_log(4, "OOM rx buffer");
+        s_rx_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
     sys_log(1, "RX buf OK %d bytes heap=%lu",
             P25_USB_BUF_LENGTH, (unsigned long)esp_get_free_heap_size());
 
@@ -187,8 +248,10 @@ static void p25_rx_task(void *arg)
         if (SCAN.request_tune && SCAN.peak_freq > 0) {
             SCAN.request_tune = false;
             s_tune_freq_hz = SCAN.peak_freq;
-            rtlsdr_set_center_freq(rtldev, s_tune_freq_hz);
-            rtlsdr_reset_buffer(rtldev);
+            if (dev) {
+                rtlsdr_set_center_freq(dev, s_tune_freq_hz);
+                rtlsdr_reset_buffer(dev);
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
             sys_log(1, "Tuned: %.4f MHz", s_tune_freq_hz / 1e6);
         }
@@ -197,9 +260,9 @@ static void p25_rx_task(void *arg)
             int gain = rtl_gain_request;
             rtl_gain_request = -1;
             P25.rtl_gain_tenths = gain;
-            if (rtldev) {
-                rtlsdr_set_tuner_gain_mode(rtldev, gain == 0 ? 0 : 1);
-                if (gain > 0) rtlsdr_set_tuner_gain(rtldev, gain);
+            if (dev) {
+                rtlsdr_set_tuner_gain_mode(dev, gain == 0 ? 0 : 1);
+                if (gain > 0) rtlsdr_set_tuner_gain(dev, gain);
             }
             sys_log(1, "RTL gain: %.1f dB%s", gain / 10.0f, gain == 0 ? " (AGC)" : "");
         }
@@ -216,12 +279,24 @@ static void p25_rx_task(void *arg)
             }
         }
 
+        /* Recheck the active flag right before issuing a USB transfer.
+         * This is the cheap-but-effective fix for the "scary errors
+         * flashing on switch" - if the framework has already flipped
+         * s_app_active to false, we exit cleanly here without spending
+         * 16 ms in a doomed bulk read. */
+        if (!s_app_active) break;
+
         bool full = true;
         for (int i = 0; i < P25_USB_BUF_LENGTH; i += P25_USB_PACKET_SIZE) {
-            int r = rtlsdr_read_sync(rtldev, &s_iq_buf[i], P25_USB_PACKET_SIZE, &n_read);
+            if (!s_app_active || !dev) { full = false; break; }
+            int r = rtlsdr_read_sync(dev, &s_iq_buf[i], P25_USB_PACKET_SIZE, &n_read);
             if (r < 0) {
                 full = false; read_errors++;
-                if (read_errors <= 3) sys_log(4, "USB err r=%d", r);
+                /* During a switch (s_app_active just went false on the
+                 * other thread), USB transfers can return short or with
+                 * a stale-handle error. Don't surface those as scary
+                 * red errors - they're an expected part of teardown. */
+                if (s_app_active && read_errors <= 3) sys_log(4, "USB err r=%d", r);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;
             }
@@ -301,15 +376,32 @@ static void p25_rx_task(void *arg)
             iq_bucket = 0; audio_bucket = 0; stats_ts = now;
         }
 
+        /* Liveness heartbeat: when not synced, log a one-line summary
+         * every 10 seconds so the LOG page actually reflects what P25
+         * is doing. Without this, an idle P25 produces zero log entries
+         * and the page looks dead even though the task is healthy. */
+        {
+            static int64_t last_hb_us = 0;
+            if (!P25.dsd_has_sync && (now - last_hb_us) > 10000000LL) {
+                last_hb_us = now;
+                sys_log(0, "alive: iq=%d%% ring=%d/%d gain=%d.%d sweeps=%d",
+                        (int)(P25.iq_level * 100.0f + 0.5f),
+                        P25.ring_fill, P25.ring_size,
+                        P25.rtl_gain_tenths / 10, P25.rtl_gain_tenths % 10,
+                        SCAN.sweep_count);
+            }
+        }
+
         if (read_errors > 20) {
-            sys_log(4, "Read errors, pause 2s");
+            if (s_app_active) sys_log(4, "Read errors, pause 2s");
             vTaskDelay(pdMS_TO_TICKS(2000));
             read_errors = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    for (int i = 0; i < 200 && s_dsd_running; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    /* Wait for dsd task to drain. */
+    for (int i = 0; i < 300 && s_dsd_running; i++) vTaskDelay(pdMS_TO_TICKS(10));
     free(s_iq_buf);
     s_iq_buf = NULL;
     s_rx_running = false;
@@ -319,11 +411,36 @@ static void p25_rx_task(void *arg)
 static void p25_on_enter(void)
 {
     if (s_app_active) return;
-    s_app_active = true;
 
-    P25.demod_gain = -9000.0f;
-    P25.rtl_gain_tenths = RTL_DEFAULT_GAIN;
-    P25.sync_beep_enabled = false;
+    /* Clear visible state so the TUI doesn't briefly show stale numbers
+     * from the previous session. */
+    P25.dsd_has_sync       = false;
+    P25.dsd_nac            = 0;
+    P25.dsd_tg             = 0;
+    P25.dsd_src            = 0;
+    P25.dsd_ftype[0]       = 0;
+    P25.dsd_fsubtype[0]    = 0;
+    P25.dsd_err_str[0]     = 0;
+    P25.dsd_modulation[0]  = 0;
+    P25.iq_level           = 0;
+    P25.read_errors        = 0;
+    P25.ring_fill          = 0;
+    P25.iq_bytes_sec       = 0;
+    P25.audio_samples_sec  = 0;
+    P25.voice_active_until_us = 0;
+
+    P25.demod_gain         = -9000.0f;
+    /* Gain: prefer the user's saved value from settings/NVS over the
+     * compiled-in default. Without this, every switch back to P25
+     * stomps user adjustments back to RTL_DEFAULT_GAIN, making the
+     * Settings-page gain control and the [g] keybind effectively
+     * write-only. */
+    {
+        const app_t *cur = app_current();
+        int saved = cur ? settings_get_gain(cur) : RTL_DEFAULT_GAIN;
+        P25.rtl_gain_tenths = (saved >= 0) ? saved : RTL_DEFAULT_GAIN;
+    }
+    P25.sync_beep_enabled  = false;
 
     scanner_init();
 
@@ -331,6 +448,9 @@ static void p25_on_enter(void)
     rtldev = rtlsdr_dev_get();
 
     if (rtldev) {
+        const app_t *cur = app_current();
+        uint32_t freq = cur ? settings_get_freq(cur) : s_tune_freq_hz;
+        if (freq) s_tune_freq_hz = freq;
         rtlsdr_set_center_freq(rtldev, s_tune_freq_hz);
         rtlsdr_set_sample_rate(rtldev, RTL_SAMPLE_RATE);
         rtlsdr_set_tuner_gain_mode(rtldev, P25.rtl_gain_tenths == 0 ? 0 : 1);
@@ -338,25 +458,50 @@ static void p25_on_enter(void)
         rtlsdr_set_tuner_bandwidth(rtldev, 0);
         rtlsdr_reset_buffer(rtldev);
         sys_log(1, "Radio: %.4f MHz %dkSPS", s_tune_freq_hz / 1e6, RTL_SAMPLE_RATE / 1000);
+    } else {
+        sys_log(4, "no RTL device available");
     }
 
+    s_app_active = true;
     xTaskCreatePinnedToCore(p25_rx_task, "p25_rx", 16384, NULL, 5, NULL, 1);
 }
 
 static void p25_on_exit(void)
 {
+    /* Clear the active flag first - both tasks check it before issuing
+     * new USB transfers, so they exit cleanly between transfers rather
+     * than mid-flight. */
     s_app_active = false;
+
+    /* Wait for both tasks to drain, but cap the wait. The rx_task is
+     * responsible for joining the dsd_task before clearing s_rx_running,
+     * so once s_rx_running is false everything is genuinely cleaned up. */
     for (int i = 0; i < 300 && (s_rx_running || s_dsd_running); i++)
         vTaskDelay(pdMS_TO_TICKS(10));
-    rtldev = NULL;
+
+    if (s_rx_running || s_dsd_running) {
+        ESP_LOGW(TAG, "drain timeout: rx=%d dsd=%d",
+                 s_rx_running, s_dsd_running);
+    }
+
+    /* Note: NOT setting rtldev = NULL. The device handle is owned by
+     * rtlsdr_dev.c; apps fetch it on entry via rtlsdr_dev_get() and
+     * leave it alone otherwise. NULLing it raced the dsd task's tail
+     * logging on the previous version. */
 }
 
 static void p25_on_sample(uint8_t *iq, int len)
 {
+    /* P25 owns its own bulk-read loop in p25_rx_task because it needs
+     * different packet sizing (16 KB vs ADS-B's 32 KB) and its DSP
+     * cadence is tied to the read schedule. The framework's stream
+     * dispatcher (radio/stream.c) is ADS-B-only; this callback is a
+     * required-interface stub that never gets called for P25. */
     (void)iq; (void)len;
 }
 
 extern void p25_draw_main(int top, int rows, int cols);
+extern void p25_draw_signal(int top, int rows, int cols);
 extern void p25_on_key(tui_key_t k);
 
 static const app_t P25_APP = {
@@ -364,14 +509,18 @@ static const app_t P25_APP = {
     .default_freq = 154785000UL,
     .default_rate = RTL_SAMPLE_RATE,
     .default_gain = RTL_DEFAULT_GAIN,
+    .banner       = "TRUNK MONITOR",
+    .signal_label = "DEMOD",
     .on_enter     = p25_on_enter,
     .on_exit      = p25_on_exit,
     .on_sample    = p25_on_sample,
 #ifdef CONFIG_ENABLE_TUI
     .draw_main    = p25_draw_main,
+    .draw_signal  = p25_draw_signal,
     .on_key       = p25_on_key,
 #else
     .draw_main    = NULL,
+    .draw_signal  = NULL,
     .on_key       = NULL,
 #endif
 };
