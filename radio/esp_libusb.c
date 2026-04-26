@@ -120,6 +120,11 @@ static int bulk_xfer_init(class_driver_t *driver_obj, int length,
                           unsigned char endpoint)
 {
     s_xfer_size = usb_round_up_to_mps(length, 512);
+    ESP_LOGI(TAG_ADSB,
+             "bulk_xfer_init: length=%d size=%u ep=0x%02x dev_hdl=%p driver=%p",
+             length, (unsigned)s_xfer_size, endpoint,
+             driver_obj ? driver_obj->dev_hdl : NULL,
+             (void *)driver_obj);
     for (int i = 0; i < BULK_XFER_SLOTS; i++) {
         s_xfer_sem[i] = xSemaphoreCreateBinary();
         if (!s_xfer_sem[i]) {
@@ -128,7 +133,9 @@ static int bulk_xfer_init(class_driver_t *driver_obj, int length,
         }
         esp_err_t r = usb_host_transfer_alloc(s_xfer_size, 0, &s_xfer[i]);
         if (r != ESP_OK) {
-            ESP_LOGE(TAG_ADSB, "bulk_xfer_init: xfer alloc slot %d failed", i);
+            ESP_LOGE(TAG_ADSB,
+                     "bulk_xfer_init: xfer alloc slot %d failed: 0x%x size=%u",
+                     i, r, (unsigned)s_xfer_size);
             return -1;
         }
         s_xfer[i]->num_bytes        = s_xfer_size;

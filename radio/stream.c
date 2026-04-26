@@ -13,6 +13,9 @@ static const char *TAG = "stream";
 
 extern rtlsdr_dev_t *rtlsdr_dev_get(void);
 
+extern volatile bool adsb_rx_should_run;
+extern volatile bool adsb_rx_running;
+
 void adsb_rx_task(void *arg)
 {
     rtlsdr_dev_t *dev = rtlsdr_dev_get();
@@ -30,7 +33,9 @@ void adsb_rx_task(void *arg)
     uint64_t errors = 0;
     int64_t last_report_us = esp_timer_get_time();
 
-    while (1) {
+    adsb_rx_running = true;
+
+    while (adsb_rx_should_run) {
         loops++;
         bool full = true;
         for (int i = 0; i < STREAM_BUFFER_BYTES; i += STREAM_PACKET_SIZE) {
@@ -63,6 +68,7 @@ void adsb_rx_task(void *arg)
     }
 
     free(buffer);
+    extern volatile bool adsb_rx_running_flag;
     vTaskDelete(NULL);
 }
 

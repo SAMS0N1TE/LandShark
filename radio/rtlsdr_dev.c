@@ -1,10 +1,3 @@
-/* rtlsdr_dev.c - RTL-SDR device init and runtime tuning.
- *
- * The setup task runs OUTSIDE the USB host event callback - control
- * transfers issued during init need the host event loop to process their
- * completions, and that loop is blocked while the callback runs. Doing
- * the setup synchronously from the callback deadlocks. */
-
 #include "rtlsdr_dev.h"
 #include "rtl-sdr.h"
 #include "app_registry.h"
@@ -13,8 +6,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-
-extern void adsb_rx_task(void *arg);
 
 static const char *TAG = "rtlsdr_dev";
 
@@ -37,29 +28,14 @@ static void rtlsdr_setup_task(void *arg)
         return;
     }
 
-    const app_t *cur = app_current();
-    uint32_t freq = cur ? settings_get_freq(cur) : 1090000000UL;
-    uint32_t rate = cur ? cur->default_rate     : 2000000UL;
-    int      gain = cur ? settings_get_gain(cur) : 496;
-
-    rtlsdr_set_center_freq(s_dev, freq);
-    rtlsdr_set_sample_rate(s_dev, rate);
-
-    /* Manual gain at the tuner max plus digital AGC on - dump1090's
-     * working ADS-B recipe. The "auto" tuner mode locks VGA at 26.5 dB
-     * which is too low for distant 1090 MHz squitter bursts. */
-    rtlsdr_set_tuner_gain_mode(s_dev, 1);
-    rtlsdr_set_tuner_gain(s_dev, gain);
-    rtlsdr_set_agc_mode(s_dev, 1);
     rtlsdr_set_freq_correction(s_dev, 0);
-
     rtlsdr_reset_buffer(s_dev);
 
-    event_bus_publish_simple(EVT_TUNER_LOCKED, cur ? cur->name : "rtlsdr");
-    ESP_LOGI(TAG, "tuner locked  %lu Hz  %lu sps  gain=%d",
-             (unsigned long)freq, (unsigned long)rate, gain);
+    event_bus_publish_simple(EVT_TUNER_LOCKED, "rtlsdr");
+    ESP_LOGI(TAG, "device opened, awaiting app config");
 
-    xTaskCreatePinnedToCore(adsb_rx_task, "adsb_rx", 16384, NULL, 5, NULL, 1);
+    const app_t *cur = app_current();
+    if (cur && cur->on_enter) cur->on_enter();
 
     vPortFree(sa);
     vTaskDelete(NULL);

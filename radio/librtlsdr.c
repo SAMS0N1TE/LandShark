@@ -127,6 +127,10 @@ struct rtlsdr_dev
     int driver_active;
     unsigned int xfer_errors;
     int i2c_repeater_on;
+    /* EEPROM strings; populated in rtlsdr_open(), used by tuner driver
+     * to detect RTL-SDR Blog V4 (triplexer requires special handling). */
+    char manufact[256];
+    char product[256];
 };
 
 void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
@@ -1360,6 +1364,16 @@ void esp_action_get_dev_desc(rtlsdr_dev_t *dev)
     usb_print_config_descriptor(config_desc, NULL);
 }
 
+int rtlsdr_check_dongle_model(void *dev_, const char *manufact_check, const char *product_check)
+{
+    rtlsdr_dev_t *dev = (rtlsdr_dev_t *)dev_;
+    if (!dev) return 0;
+    if (strcmp(dev->manufact, manufact_check) == 0 &&
+        strcmp(dev->product,  product_check)  == 0)
+        return 1;
+    return 0;
+}
+
 int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t client_hdl)
 {
     int r;
@@ -1496,6 +1510,20 @@ found:
         r = dev->tuner->init(dev);
 
     rtlsdr_set_i2c_repeater(dev, 0);
+
+    {
+        char tmp_serial[256];
+        memset(dev->manufact, 0, sizeof(dev->manufact));
+        memset(dev->product,  0, sizeof(dev->product));
+        memset(tmp_serial,    0, sizeof(tmp_serial));
+        rtlsdr_get_usb_strings(dev, dev->manufact, dev->product, tmp_serial);
+        ESP_LOGI(TAG_ADSB, "USB strings: manufact='%s' product='%s'",
+                 dev->manufact, dev->product);
+        if (strcmp(dev->manufact, "RTLSDRBlog") == 0 &&
+            strcmp(dev->product,  "Blog V4")   == 0) {
+            ESP_LOGI(TAG_ADSB, "*** RTL-SDR Blog V4 detected - triplexer active ***");
+        }
+    }
 
     *out_dev = dev;
 
