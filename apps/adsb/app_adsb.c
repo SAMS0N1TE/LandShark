@@ -67,6 +67,11 @@ static void adsb_on_exit(void)
 {
     adsb_rx_should_run = false;
     s_age_should_run   = false;
+    /* Drain wait: the rx_task and age_task both check their *_should_run
+     * flag at the top of their loops. Up to ~3 seconds is generous; in
+     * practice the rx loop turns over every ~16 ms (one bulk read at
+     * 2 MSPS / 32 KB), so drain happens in well under 100 ms unless USB
+     * is mid-error. */
     for (int i = 0; i < 300 && (adsb_rx_running || s_age_running); i++)
         vTaskDelay(pdMS_TO_TICKS(10));
 }
@@ -76,6 +81,8 @@ static const app_t ADSB_APP = {
     .default_freq = 1090000000UL,
     .default_rate = 2000000,
     .default_gain = 496,
+    .banner       = "ATC TERMINAL",
+    .signal_label = "MODE-S",
     .on_enter     = adsb_on_enter,
     .on_exit      = adsb_on_exit,
     .on_sample    = adsb_on_sample,
@@ -84,6 +91,7 @@ static const app_t ADSB_APP = {
 #else
     .draw_main    = NULL,
 #endif
+    .draw_signal  = NULL,   /* use framework default Mode-S analyzer */
     .on_key       = NULL,
 };
 
