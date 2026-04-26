@@ -54,6 +54,9 @@ extern int adsb_app_register(void);
 #ifdef CONFIG_APP_VHF
 extern int vhf_app_register(void);
 #endif
+#ifdef CONFIG_APP_P25
+extern int p25_app_register(void);
+#endif
 
 extern void class_driver_task(void *arg);
 extern void class_driver_client_deregister(void);
@@ -136,6 +139,9 @@ void app_main(void)
 #endif
 #ifdef CONFIG_APP_VHF
     vhf_app_register();
+#endif
+#ifdef CONFIG_APP_P25
+    p25_app_register();
 #endif
 
     {
