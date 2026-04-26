@@ -1,0 +1,73 @@
+menu "ESP32-P4 SDR Tool"
+
+    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
+
+    config APP_QUIT_PIN
+        int "App Quit button GPIO pin"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 0
+        help
+            GPIO pin used as the quit button. Pulled up by default; pressing
+            to GND triggers an orderly shutdown of the USB host and tasks.
+
+    menu "User Interface"
+
+        config ENABLE_TUI
+            bool "Enable terminal UI (TUI)"
+            default y
+            help
+                When enabled, the device renders a full-screen ANSI terminal UI
+                over UART0 with a plane table, event log, waterfall, and
+                settings pages. Requires a 128x38+ terminal. When disabled,
+                the firmware boots headless and uses whichever output sinks
+                are configured below.
+
+    endmenu
+
+    menu "Output Sinks"
+
+        config OUTPUT_HUMAN_LOG
+            bool "Human-readable ESP_LOG output to UART"
+            default y if !ENABLE_TUI
+            default n
+            help
+                Routes ESP_LOG calls to the UART for direct viewing.
+                Useful when running headless without the TUI. Safe to
+                enable alongside the event stream; the two formats are
+                visually distinct.
+
+        config OUTPUT_EVENT_STREAM
+            bool "Machine-readable JSONL event stream over UART"
+            default n
+            help
+                Emits one JSON object per line for every published event
+                (new contact, lost contact, position fix, etc). Designed
+                for a host SBC or PC to consume programmatically. Each
+                line is prefixed with a single-byte marker (ASCII 0x1E)
+                so it can be cleanly demuxed from human log output if
+                both are enabled on the same UART.
+
+    endmenu
+
+    menu "Radio Apps"
+
+        config APP_ADSB
+            bool "ADS-B (1090 MHz Mode-S)"
+            default y
+            help
+                Receives 1090 MHz extended squitter messages from aircraft
+                using an RTL-SDR dongle. Decodes ICAO, callsign, altitude,
+                velocity, heading, vertical rate, and CPR position pairs.
+
+        config APP_VHF
+            bool "VHF FM (scaffold)"
+            default n
+            help
+                Scaffold for a future VHF FM receiver app. Registers with
+                the app framework but does not yet decode anything. Enabling
+                this currently has no runtime effect beyond making the app
+                selectable from the multi-app cycle key.
+
+    endmenu
+
+endmenu
