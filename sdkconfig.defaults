@@ -1,0 +1,39 @@
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=4096
+CONFIG_USB_HOST_DEBOUNCE_DELAY_MS=500
+CONFIG_USB_HOST_RESET_HOLD_MS=30
+CONFIG_USB_HOST_RESET_RECOVERY_MS=300
+CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS=10
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+# Disable task WDT monitoring of the CPU1 idle task. Core 1 runs our
+# compute-bound DSP pipeline (p25_rx_task and dsd_decode, both priority
+# 5), and the idle task can genuinely starve for multi-second stretches
+# during sustained USB bulk reads + DSP + FD audio processing. The WDT
+# warnings that result are just noise — nothing is actually stuck.
+# CPU0 idle monitoring is still enabled (default), so infinite loops
+# or hangs in TUI / USB host / diag / beep / fd_audio tasks are still
+# caught.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ── Release-grade optimization ──────────────────────────────
+# Default was -Og (debug), which is 5-10x slower than -O2 for
+# our float-heavy DSP path. This is the single biggest factor
+# in whether the RX pipeline can keep up with 960 kSPS from the
+# RTL-SDR. -O2 + silent asserts is the standard release config.
+#
+# If debugging a crash, temporarily revert by commenting these
+# out — -Og produces more readable backtraces.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
