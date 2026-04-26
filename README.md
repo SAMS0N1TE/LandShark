@@ -1,6 +1,6 @@
 # LandShark
 
-A handheld SDR scanner running on the Waveshare ESP32-P4-NANO with an RTL-SDR Blog V4 plugged into its USB host port. Two apps right now: ADS-B aircraft tracking and P25 Phase 1 voice decode. Plan is to add more.
+A handheld SDR scanner running on the Waveshare [ESP32-P4-NANO](https://www.waveshare.com/esp32-p4-nano.htm?srsltid=AfmBOoqwx_UtnddP57XurmPjLDD6xyBxvlo3kfWMzl45RvUZGmMNA4tY) with an [RTL-SDR Blog V4](https://www.ebay.com/str/rtlsdrblog?_trksid=p4429486.m3561.l161211) plugged into its USB host port. Two apps right now: ADS-B aircraft tracking and P25 Phase 1 voice decode. Plan is to add more.
 
 The whole thing is one firmware image. You hold a button or hit a key to switch between apps and the radio retunes on the fly. There's a TUI over the USB serial console (115200 8N1) so you can poke at it from a laptop, and an audio output through the onboard ES8311 codec for voice and confirmation beeps.
 
