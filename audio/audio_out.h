@@ -23,6 +23,8 @@ esp_err_t audio_out_init(void);
 
 void audio_write_mono(const int16_t *samples, int n);
 
+void audio_write_p25_voice(const int16_t *src8k, int n);
+
 void audio_toggle_mute(void);
 bool audio_is_muted(void);
 void audio_volume_delta(int d);

@@ -50,6 +50,26 @@ void audio_write_mono(const int16_t *samples, int n)
     }
 }
 
+void audio_write_p25_voice(const int16_t *src8k, int n)
+{
+    if (n <= 0) return;
+    static int16_t up16k[1024];
+    static int16_t prev = 0;
+    int i = 0;
+    while (i < n) {
+        int chunk_in = n - i;
+        if (chunk_in > 512) chunk_in = 512;
+        for (int k = 0; k < chunk_in; k++) {
+            int16_t s = src8k[i + k];
+            up16k[k * 2]     = (int16_t)(((int)prev + (int)s) >> 1);
+            up16k[k * 2 + 1] = s;
+            prev = s;
+        }
+        audio_write_mono(up16k, chunk_in * 2);
+        i += chunk_in;
+    }
+}
+
 esp_err_t audio_out_init(void)
 {
     const i2c_config_t i2c_cfg = {
