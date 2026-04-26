@@ -1,11 +1,13 @@
-/* app_adsb.c - ADS-B app registration and periodic-age driver. */
-
 #include "app_registry.h"
+#include "settings.h"
+#include "event_bus.h"
 #include "adsb_decode.h"
 #include "adsb_state.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_log.h"
+#include "rtl-sdr.h"
 #include "sdkconfig.h"
 
 #ifdef CONFIG_ENABLE_TUI
@@ -13,12 +15,25 @@ extern void adsb_draw_main(int top, int rows, int cols);
 extern void adsb_on_enter_tui(void);
 #endif
 
+extern void adsb_rx_task(void *arg);
+extern rtlsdr_dev_t *rtlsdr_dev_get(void);
+
+volatile bool adsb_rx_should_run = false;
+volatile bool adsb_rx_running    = false;
+
+static const char *TAG = "adsb";
+static volatile bool s_age_running = false;
+static volatile bool s_age_should_run = false;
+
 static void age_task(void *arg)
 {
-    while (1) {
+    s_age_running = true;
+    while (s_age_should_run) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         adsb_periodic_age(esp_timer_get_time());
     }
+    s_age_running = false;
+    vTaskDelete(NULL);
 }
 
 static void adsb_on_enter(void)
@@ -26,8 +41,35 @@ static void adsb_on_enter(void)
 #ifdef CONFIG_ENABLE_TUI
     adsb_on_enter_tui();
 #endif
+
+    rtlsdr_dev_t *dev = rtlsdr_dev_get();
+    if (dev) {
+        const app_t *cur = app_current();
+        uint32_t freq = cur ? settings_get_freq(cur) : 1090000000UL;
+        int      gain = cur ? settings_get_gain(cur) : 496;
+        rtlsdr_set_center_freq(dev, freq);
+        rtlsdr_set_sample_rate(dev, 2000000);
+        rtlsdr_set_tuner_gain_mode(dev, 1);
+        rtlsdr_set_tuner_gain(dev, gain);
+        rtlsdr_set_agc_mode(dev, 1);
+        rtlsdr_reset_buffer(dev);
+        ESP_LOGI(TAG, "tuned %lu Hz 2 MSPS gain=%d", (unsigned long)freq, gain);
+    }
+
+    s_age_should_run = true;
+    xTaskCreatePinnedToCore(age_task, "adsb_age", 3072, NULL, 1, NULL, 1);
+
+    adsb_rx_should_run = true;
+    xTaskCreatePinnedToCore(adsb_rx_task, "adsb_rx", 16384, NULL, 5, NULL, 1);
 }
-static void adsb_on_exit(void) { }
+
+static void adsb_on_exit(void)
+{
+    adsb_rx_should_run = false;
+    s_age_should_run   = false;
+    for (int i = 0; i < 300 && (adsb_rx_running || s_age_running); i++)
+        vTaskDelay(pdMS_TO_TICKS(10));
+}
 
 static const app_t ADSB_APP = {
     .name         = "ADS-B",
@@ -50,6 +92,5 @@ const app_t *adsb_app_desc(void) { return &ADSB_APP; }
 int adsb_app_register(void)
 {
     adsb_decode_init();
-    xTaskCreatePinnedToCore(age_task, "adsb_age", 3072, NULL, 1, NULL, 1);
     return app_register(&ADSB_APP);
 }
