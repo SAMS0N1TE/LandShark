@@ -68,6 +68,30 @@ menu "ESP32-P4 SDR Tool"
                 this currently has no runtime effect beyond making the app
                 selectable from the multi-app cycle key.
 
+        config APP_P25
+            bool "P25 Phase 1 (digital voice)"
+            default y
+            help
+                Project 25 Phase 1 (FDMA) digital voice decoder. Decodes
+                C4FM and CQPSK on a single talkgroup at 154.785 MHz default
+                (configurable). Includes BCH(63,16,11) NID correction,
+                Reed-Solomon HDU/LDU correction, IMBE+ voice synthesis via
+                mbelib, and a UART1 telemetry channel for diagnostics.
+
+    endmenu
+
+    menu "P25 Diagnostics"
+        depends on APP_P25
+
+        config P25_DIAG_UART
+            bool "Enable UART1 telemetry channel"
+            default y
+            help
+                When enabled, P25 emits one CSV-ish status line per
+                second on UART1 (GPIO 32 TX / GPIO 33 RX, 921600 baud).
+                Useful for inspecting BCH success rates, sync attempts,
+                and frame counts without polluting the TUI.
+
     endmenu
 
 endmenu
