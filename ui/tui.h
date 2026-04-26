@@ -68,6 +68,7 @@ void tui_waterfall_push(const uint16_t *mag, int mag_len);
 void tui_waterfall_reset(void);
 
 bool settings_handle_key(tui_key_t k);
+bool settings_is_editing(void);
 
 void tui_goto(int row, int col);
 void tui_hline(int row, int col, int n);

@@ -21,9 +21,18 @@ static bool dispatch_key(tui_key_t raw)
     if (raw == TK_NONE) return false;
     int k = (int)raw;
 
+    /* When the settings page is mid-edit (frequency entry), every key
+     * goes to settings_handle_key() first - including digits, which
+     * would otherwise be intercepted by the page-switch shortcuts
+     * below. The settings handler returns true if it consumed the key,
+     * which it always does in edit mode. */
+    if (settings_is_editing()) {
+        if (settings_handle_key((tui_key_t)k)) return true;
+    }
+
     switch (k) {
     case '1': page_set(PAGE_MAIN);      tui_mark_dirty(); return true;
-    case '2': page_set(PAGE_WATERFALL); tui_mark_dirty(); return true;
+    case '2': page_set(PAGE_SIGNAL);    tui_mark_dirty(); return true;
     case '3': page_set(PAGE_LOG);       tui_mark_dirty(); return true;
     case '4': page_set(PAGE_SETTINGS);  tui_mark_dirty(); return true;
     case TK_TAB: page_cycle_next();     tui_mark_dirty(); return true;

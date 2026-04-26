@@ -4,10 +4,12 @@
  * Render order each frame:
  *   1. Cursor home (\033[H) - no CLS to avoid flicker.
  *   2. Header (app name, frequency, rate, uptime, stats).
- *   3. Page tab bar (MAIN / WATERFALL / LOG / SETTINGS).
+ *   3. Page tab bar (MAIN / SIGNAL / LOG / SETTINGS).
+ *      The SIGNAL label is supplied per-app via app_t::signal_label,
+ *      so it reads MODE-S on ADS-B and DEMOD on P25, etc.
  *   4. Page body - dispatches to:
  *        PAGE_MAIN     Ã¢â€ â€™ active app's draw_main()
- *        PAGE_WATERFALL Ã¢â€ â€™ draw_waterfall()
+ *        PAGE_SIGNAL   -> active apps draw_signal() if set, else built-in
  *        PAGE_LOG      Ã¢â€ â€™ draw_log()
  *        PAGE_SETTINGS Ã¢â€ â€™ draw_settings() (with key handling inline)
  *   5. Footer - key hints and audio modes.
@@ -178,7 +180,10 @@ static void draw_header(void)
 
     tui_goto(2, 1);
     printf(C_BORDER VL RESET);
-    printf(" " C_GOLD BOLD "ATC TERMINAL" RESET);
+    /* Banner is per-app: ADS-B is "ATC TERMINAL", P25 is "TRUNK MONITOR",
+     * etc. Falls back to a neutral string if the app didn't set one. */
+    const char *banner = (a && a->banner) ? a->banner : "SDR TERMINAL";
+    printf(" " C_GOLD BOLD "%s" RESET, banner);
     printf(C_DIM " // " RESET C_BRIGHT "%s" RESET, a ? a->name : "?");
     printf(C_DIM " // " RESET C_CYAN "%s" RESET, freq);
     printf(C_DIM " // " RESET C_BLUE "%lu kSps" RESET,
@@ -195,7 +200,16 @@ static void draw_header(void)
 /* -- page tab bar at row 3 ------------------------------------------- */
 static void draw_page_tabs(void)
 {
-    static const char *NAMES[] = { "MAIN", "WATERFALL", "LOG", "SETTINGS" };
+    /* Page names: tab 2 ("SIGNAL") gets relabeled per-app via the
+     * signal_label field, so on ADS-B it reads "MODE-S" (Mode-S signal
+     * analyzer) and on P25 it reads "DEMOD" (P25 demod focus page).
+     * The other three are framework-owned and stay constant. */
+    const app_t *cur_app = app_current();
+    const char *sig_label =
+        (cur_app && cur_app->signal_label) ? cur_app->signal_label : "SIGNAL";
+    const char *page_names[PAGE_COUNT] = {
+        "MAIN", sig_label, "LOG", "SETTINGS"
+    };
     page_t cur = page_current();
 
     tui_goto(3, 1);
@@ -210,21 +224,27 @@ static void draw_page_tabs(void)
         printf("  ");
         if (i == (int)cur) {
             printf(C_BG_ACT C_BRIGHT BOLD " %d:%s " RESET,
-                   i + 1, NAMES[i]);
+                   i + 1, page_names[i]);
         } else {
-            printf(C_DIM " %d:%s " RESET, i + 1, NAMES[i]);
+            printf(C_DIM " %d:%s " RESET, i + 1, page_names[i]);
         }
     }
-    /* Apps list on the right side of the tab row. */
+    /* Apps list on the right side of the tab row. Now actually
+     * enumerates registered apps via app_at()/app_count() instead of
+     * just printing the active one's name. */
     printf("  " C_LABEL "APP: " RESET);
-    for (int i = 0; /* loop over registered apps */; i++) {
-        if (i >= 4) break;
-        /* We don't have a public enumerator; use app_current for the
-         * active one and a fixed ordering. This is coarse but fine. */
-        break;
+    int n = app_count();
+    int active = app_current_index();
+    for (int i = 0; i < n; i++) {
+        const app_t *ai = app_at(i);
+        if (!ai || !ai->name) continue;
+        if (i == active) printf(C_GOLD BOLD " %s " RESET, ai->name);
+        else             printf(C_DIM     " %s " RESET, ai->name);
     }
-    printf(C_GOLD BOLD " %s " RESET, app_current() ? app_current()->name : "?");
     printf(C_DIM "[A] next" RESET);
+    if (app_switch_in_progress()) {
+        printf(C_AMBER " (switching..)" RESET);
+    }
     printf(EL);
     tui_goto(4, TUI_COLS);
     printf(C_BORDER VL RESET);
@@ -520,6 +540,15 @@ static void draw_page_waterfall(int top_row, int rows, int cols)
 /* -- page: log ------------------------------------------------------- */
 static void draw_page_log(int top_row, int rows, int cols)
 {
+    (void)cols;
+    /* Pre-clear the body region. Without this, leftover rows from the
+     * previous page leak through any row this page doesn't write to
+     * (e.g. the gap row between the title and the first log line). */
+    for (int r = top_row; r < top_row + rows; r++) {
+        tui_goto(r, 3);
+        fputs(EL, stdout);
+    }
+
     tui_goto(top_row, 3);
     printf(C_LABEL "EVENT LOG" RESET C_DIM
            "  (newest first, %d entries buffered)" RESET EL, s_log_count);
@@ -531,11 +560,6 @@ static void draw_page_log(int top_row, int rows, int cols)
         tui_log_entry_t *e = &s_log[idx];
         tui_goto(top_row + 2 + i, 3);
         printf("%s%s" RESET EL, LOG_COL[e->color], e->text);
-    }
-    /* Clear below */
-    for (int i = visible; i < rows - 2; i++) {
-        tui_goto(top_row + 2 + i, 3);
-        printf(EL);
     }
 }
 
@@ -559,6 +583,15 @@ static bool            s_edit_freq = false;
 static char            s_edit_buf[16];
 static int             s_edit_len = 0;
 
+/* Public probe: true when the settings page is mid-edit (digits should
+ * route to the edit buffer, not to page-switch shortcuts). The TUI key
+ * dispatcher checks this BEFORE its '1' '2' '3' '4' page shortcut so a
+ * user typing a frequency can include digits 1-4 in the value. */
+bool settings_is_editing(void)
+{
+    return s_edit_freq;
+}
+
 static void settings_enter_edit(void)
 {
     const app_t *a = app_current();
@@ -576,6 +609,16 @@ static void settings_commit_edit(void)
     if (hz >= 1000000 && hz <= 2000000000) {
         settings_set_freq(a, hz);
         tui_log(1, "SETTING   freq set to %lu Hz", (unsigned long)hz);
+
+        /* Apply the new freq to the live radio so the user doesn't
+         * have to switch apps to make it take effect. settings_set_freq
+         * above persists to NVS; rtlsdr_dev_set_freq retunes the running
+         * RTL-SDR. The active app's RX task will keep running on the
+         * new freq immediately; for P25, the on-screen freq display
+         * pulls from settings_get_freq() so it'll catch up on the next
+         * frame. */
+        extern uint32_t rtlsdr_dev_set_freq(uint32_t hz);
+        rtlsdr_dev_set_freq(hz);
     } else {
         tui_log(4, "SETTING   %lu Hz out of range, ignored",
                 (unsigned long)hz);
@@ -616,6 +659,8 @@ bool settings_handle_key(tui_key_t k)
             int g = settings_get_gain(a) - 10;
             if (g < 0) g = 0;
             settings_set_gain(a, g);
+            extern int rtlsdr_dev_set_gain(int tenths_db);
+            rtlsdr_dev_set_gain(g);
             tui_log(1, "SETTING   gain %d.%d dB", g / 10, g % 10);
         } else if (s_sel == S_FAV_LIST) {
             if (s_fav_sel > 0) s_fav_sel--;
@@ -651,6 +696,8 @@ bool settings_handle_key(tui_key_t k)
             int g = settings_get_gain(a) + 10;
             if (g > 600) g = 600;
             settings_set_gain(a, g);
+            extern int rtlsdr_dev_set_gain(int tenths_db);
+            rtlsdr_dev_set_gain(g);
             tui_log(1, "SETTING   gain %d.%d dB", g / 10, g % 10);
         } else if (s_sel == S_FAV_LIST) {
             if (s_fav_sel < MAX_FAVOURITES - 1) s_fav_sel++;
@@ -702,8 +749,16 @@ bool settings_handle_key(tui_key_t k)
 
 static void draw_page_settings(int top_row, int rows, int cols)
 {
+    (void)cols;
     const app_t *a = app_current();
     if (!a) return;
+
+    /* Pre-clear the body region. Without this, leftover rows from the
+     * previous page leak through any row this page doesn't write to. */
+    for (int rr = top_row; rr < top_row + rows; rr++) {
+        tui_goto(rr, 3);
+        fputs(EL, stdout);
+    }
 
     tui_goto(top_row, 3);
     printf(C_LABEL "SETTINGS " RESET C_GOLD BOLD "%s" RESET C_DIM
@@ -717,10 +772,12 @@ static void draw_page_settings(int top_row, int rows, int cols)
     if (s_sel == S_FREQ) printf(C_BG_ACT);
     printf(C_LABEL " %-14s " RESET, "FREQUENCY");
     if (s_edit_freq) {
-        printf(C_AMBER "[edit] " C_BRIGHT "%s" C_AMBER "_" RESET, s_edit_buf);
+        printf(C_AMBER "[EDIT] " C_BRIGHT "%s" C_AMBER "_" RESET
+               C_DIM "  Hz   ([0-9] type, [Bksp] del, [Enter] save, [Esc] cancel)" RESET,
+               s_edit_buf);
     } else {
         char hz[24]; fmt_hz(hz, sizeof(hz), settings_get_freq(a));
-        printf(C_CYAN "%s" RESET, hz);
+        printf(C_CYAN "%s" RESET C_DIM "   ([Enter] to edit)" RESET, hz);
     }
     printf(EL);
 
@@ -782,12 +839,6 @@ static void draw_page_settings(int top_row, int rows, int cols)
     if (s_sel == S_VOICE_TEST) printf(C_BG_ACT);
     printf(C_LABEL " %-14s " RESET C_AMBER "[ENTER to speak]" RESET EL,
            "TEST VOICE");
-
-    /* Clear rest. */
-    while (r < top_row + rows) {
-        tui_goto(r++, 3);
-        printf(EL);
-    }
 }
 
 /* -- side-border painter --------------------------------------------- */
@@ -882,7 +933,19 @@ void tui_draw(void)
     /* Clear body + paint sides. Clearing happens inside each draw_*. */
     switch (page_current()) {
     case PAGE_MAIN:      draw_page_main(body_top, body_rows, TUI_COLS - 4); break;
-    case PAGE_WATERFALL: draw_page_waterfall(body_top, body_rows, TUI_COLS - 4); break;
+    case PAGE_SIGNAL: {
+        /* Each app can supply its own signal-page renderer. ADS-B leaves
+         * draw_signal NULL and gets the framework's Mode-S analyzer
+         * (which is what its old "WATERFALL" tab did). P25 supplies
+         * p25_draw_signal which renders a P25-relevant view. */
+        const app_t *a = app_current();
+        if (a && a->draw_signal) {
+            a->draw_signal(body_top, body_rows, TUI_COLS - 4);
+        } else {
+            draw_page_waterfall(body_top, body_rows, TUI_COLS - 4);
+        }
+        break;
+    }
     case PAGE_LOG:       draw_page_log(body_top, body_rows, TUI_COLS - 4); break;
     case PAGE_SETTINGS:  draw_page_settings(body_top, body_rows, TUI_COLS - 4); break;
     default: break;
