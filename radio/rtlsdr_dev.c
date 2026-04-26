@@ -60,6 +60,13 @@ uint32_t rtlsdr_dev_set_freq(uint32_t hz)
 int rtlsdr_dev_set_gain(int tenths_db)
 {
     if (!s_dev) return -1;
+    /* gain == 0 means AGC: turn manual mode off and let the tuner
+     * track. Otherwise switch to manual mode and apply the value. */
+    if (tenths_db == 0) {
+        rtlsdr_set_tuner_gain_mode(s_dev, 0);
+        return 0;
+    }
+    rtlsdr_set_tuner_gain_mode(s_dev, 1);
     return rtlsdr_set_tuner_gain(s_dev, tenths_db);
 }
 int rtlsdr_dev_set_sample_rate(uint32_t hz)

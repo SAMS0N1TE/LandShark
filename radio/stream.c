@@ -39,10 +39,22 @@ void adsb_rx_task(void *arg)
         loops++;
         bool full = true;
         for (int i = 0; i < STREAM_BUFFER_BYTES; i += STREAM_PACKET_SIZE) {
+            /* Recheck the should_run flag between transfers so a switch
+             * away from ADS-B exits between bulk reads, not mid-flight.
+             * Without this, a switch can sit on the framework's
+             * on_exit drain wait for the full transfer interval (and
+             * any USB errors that occur on the last transfer get
+             * surfaced to the user as scary red logs). */
+            if (!adsb_rx_should_run) { full = false; break; }
             int r = rtlsdr_read_sync(dev, &buffer[i], STREAM_PACKET_SIZE, &n_read);
             if (r < 0) {
                 errors++;
                 full = false;
+                /* Suppress error log if we're being torn down - the USB
+                 * stack returning errors during teardown is expected. */
+                if (adsb_rx_should_run) {
+                    ESP_LOGW(TAG, "USB read err r=%d", r);
+                }
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;
             }
@@ -68,7 +80,9 @@ void adsb_rx_task(void *arg)
     }
 
     free(buffer);
-    extern volatile bool adsb_rx_running_flag;
+    /* Clear the running flag so the framework's on_exit drain wait
+     * actually sees the task as done. */
+    adsb_rx_running = false;
     vTaskDelete(NULL);
 }
 
