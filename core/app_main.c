@@ -144,6 +144,14 @@ void app_main(void)
     p25_app_register();
 #endif
 
+    /* Spin up the deferred-switch worker now that all apps are
+     * registered. After this, any caller (TUI key handler, settings
+     * page) that requests an app switch returns immediately and the
+     * worker runs on_exit/on_enter on a dedicated thread, so the TUI
+     * stays responsive even if an app's drain wait takes a few
+     * seconds. */
+    app_switch_worker_start();
+
     {
         int p  = settings_voice_preset_get();
         int lp = settings_voice_lowpass_get();
