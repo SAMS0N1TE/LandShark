@@ -72,8 +72,24 @@ static void adsb_on_exit(void)
      * practice the rx loop turns over every ~16 ms (one bulk read at
      * 2 MSPS / 32 KB), so drain happens in well under 100 ms unless USB
      * is mid-error. */
-    for (int i = 0; i < 300 && (adsb_rx_running || s_age_running); i++)
+    int waited;
+    for (waited = 0; waited < 300 && (adsb_rx_running || s_age_running); waited++)
         vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (adsb_rx_running || s_age_running) {
+        /* Drain timed out. The rx task is most likely stuck inside a
+         * blocking rtlsdr_read_sync call. Letting the framework proceed
+         * to spawn the next app's rx task would cause both tasks to
+         * compete for the same USB device, which manifests as ~22% of
+         * expected throughput in the new app and continued ADS-B-rate
+         * stream log spam. Log loudly so the user sees the cause; the
+         * framework will still proceed but with explicit warning. */
+        ESP_LOGE(TAG, "*** ADS-B drain TIMEOUT after %dms (rx=%d age=%d) ***",
+                 waited * 10, adsb_rx_running, s_age_running);
+        ESP_LOGE(TAG, "*** Next app will see degraded throughput. Reboot ***");
+    } else {
+        ESP_LOGI(TAG, "ADS-B drained cleanly in %dms", waited * 10);
+    }
 }
 
 static const app_t ADSB_APP = {
