@@ -40,3 +40,13 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
 CONFIG_APP_PROJECT_VER="1.0.0"
+# Console routing: only UART0 (the FTDI-bridged USB CDC port) carries
+# the TUI. Disable the USB-Serial-JTAG mirror so the TUI doesn't get
+# duplicated across both endpoints when both PuTTY and idf.py monitor
+# are open. To use idf.py monitor instead, swap to:
+#   CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+#   # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+#   CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG is not set
