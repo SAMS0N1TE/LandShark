@@ -23,10 +23,12 @@
 #include "tui.h"
 #include "settings.h"
 #include "rtl-sdr.h"
+#include "dsp_pipeline.h"
 
 extern volatile int rtl_gain_request;
 extern int           autoscan_bch_ok_flag;
 extern int           dsd_bch_fail_counter;
+extern dsp_state_t   s_dsp;
 
 /* ---- helpers ------------------------------------------------------- */
 
@@ -266,7 +268,7 @@ void p25_draw_main(int top, int rows, int cols)
     /* Help strap at the bottom of the page body. */
     tui_goto(top + rows - 2, 5);
     printf(C_DIM
-           "[g] gain  [G] AGC  [s] beep  [<>] freq \xc2\xb1" "25 kHz  [r] reset"
+           "[q/w] freq \xc2\xb1" "25kHz  [e] mode  [r] reset  [s] gain  [d] AGC  [f] beep"
            RESET EL);
 }
 
@@ -440,7 +442,7 @@ void p25_draw_signal(int top, int rows, int cols)
     /* Help strap. */
     tui_goto(top + rows - 2, 5);
     printf(C_DIM
-           "[g] gain  [G] AGC  [s] beep  [<>] freq \xc2\xb1" "25 kHz  [r] reset"
+           "[q/w] freq \xc2\xb1" "25kHz  [e] mode  [r] reset  [s] gain  [d] AGC  [f] beep"
            RESET EL);
 }
 
@@ -450,33 +452,9 @@ void p25_on_key(tui_key_t k)
 {
     int kk = (int)k;
     switch (kk) {
-    case 'g': {
-        /* Step gain through the common R820T2 ladder. We persist the
-         * new value via settings_set_gain so that when the user
-         * switches away and back, p25_on_enter restores their gain
-         * instead of stomping it with RTL_DEFAULT_GAIN. The async
-         * rtl_gain_request mechanism still does the live retune so
-         * the user sees feedback immediately. */
-        static const int gains[] = { 0, 90, 200, 280, 340, 370, 400, 437, 463, 496 };
-        const int n = sizeof(gains) / sizeof(gains[0]);
-        int cur = P25.rtl_gain_tenths;
-        int next_idx = 0;
-        for (int i = 0; i < n; i++) if (gains[i] == cur) { next_idx = (i + 1) % n; break; }
-        rtl_gain_request = gains[next_idx];
-        const app_t *a = app_current();
-        if (a) settings_set_gain(a, gains[next_idx]);
-        break;
-    }
-    case 'G': {
-        rtl_gain_request = 0;   /* AGC */
-        const app_t *a = app_current();
-        if (a) settings_set_gain(a, 0);
-        break;
-    }
-    case 's': case 'S':
-        P25.sync_beep_enabled = !P25.sync_beep_enabled;
-        sys_log(1, "Beep %s", P25.sync_beep_enabled ? "ON" : "OFF");
-        break;
+    /* ---- left hand: tuning + mode + reset ----------------------- */
+
+    case 'q': case 'Q':
     case '<': case ',': {
         /* Step down 25 kHz. */
         const app_t *a = app_current();
@@ -488,7 +466,10 @@ void p25_on_key(tui_key_t k)
         sys_log(1, "Tune %.4f MHz", f / 1e6);
         break;
     }
+
+    case 'w': case 'W':
     case '>': case '.': {
+        /* Step up 25 kHz. */
         const app_t *a = app_current();
         uint32_t f = (a ? settings_get_freq(a) : s_tune_freq_hz) + 25000;
         s_tune_freq_hz = f;
@@ -497,6 +478,19 @@ void p25_on_key(tui_key_t k)
         sys_log(1, "Tune %.4f MHz", f / 1e6);
         break;
     }
+
+    case 'e': case 'E': {
+        /* Cycle demod mode: C4FM -> CQPSK -> DIFF_4FSK -> FSK4_TRACKING -> wrap.
+         * The dsp_pipeline supports four demods. C4FM is the default for
+         * P25 Phase 1 Voice. CQPSK / DIFF_4FSK / FSK4_TRACKING are useful
+         * for systems that drift on C4FM or for harder-to-decode sites. */
+        static const char *names[] = { "C4FM", "CQPSK", "DIFF_4FSK", "FSK4_TRACKING" };
+        int next = (s_dsp.mode + 1) % 4;
+        dsp_set_mode(&s_dsp, (demod_mode_t)next);
+        sys_log(1, "DSP mode: %s", names[next]);
+        break;
+    }
+
     case 'r': case 'R':
         /* Reset visible counters - useful for a clean read after tuning. */
         P25.dsd_sync_count       = 0;
@@ -508,6 +502,37 @@ void p25_on_key(tui_key_t k)
         memset(s_rate_hist, 0, sizeof(s_rate_hist));
         sys_log(1, "Stats reset");
         break;
+
+    /* ---- right hand: gain + audio --------------------------------- */
+
+    case 's': case 'S': {
+        /* Step gain through the R820T2 ladder. Persist via settings_set_gain
+         * so the new value survives switches and reboots. The async
+         * rtl_gain_request still drives the live retune. */
+        static const int gains[] = { 0, 90, 200, 280, 340, 370, 400, 437, 463, 496 };
+        const int n = sizeof(gains) / sizeof(gains[0]);
+        int cur = P25.rtl_gain_tenths;
+        int next_idx = 0;
+        for (int i = 0; i < n; i++) if (gains[i] == cur) { next_idx = (i + 1) % n; break; }
+        rtl_gain_request = gains[next_idx];
+        const app_t *a = app_current();
+        if (a) settings_set_gain(a, gains[next_idx]);
+        break;
+    }
+
+    case 'd': case 'D': {
+        /* AGC toggle: 0 dB tenths means "let the tuner manage gain". */
+        rtl_gain_request = 0;
+        const app_t *a = app_current();
+        if (a) settings_set_gain(a, 0);
+        break;
+    }
+
+    case 'f': case 'F':
+        P25.sync_beep_enabled = !P25.sync_beep_enabled;
+        sys_log(1, "Beep %s", P25.sync_beep_enabled ? "ON" : "OFF");
+        break;
+
     default: break;
     }
     tui_mark_dirty();

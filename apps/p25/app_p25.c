@@ -116,12 +116,27 @@ static void dsd_decoder_task(void *arg)
 
     initState(&s_dsd_state);
     s_dsd_state.p25kid = 0;
+    /* Verbose alloc diagnostics so we can see exactly which buffer
+     * failed if any. Previously we just printed "DSD alloc FAILED"
+     * with no breakdown - but it's also possible none failed and the
+     * page is showing a stale dsd_buffers_ok=false because the task
+     * never ran. Print all five pointers before the check to confirm. */
+    sys_log(0, "DSD alloc: dibit=%p audio=%p audio_f=%p cur_mp=%p prev_mp=%p enh=%p",
+            (void*)s_dsd_state.dibit_buf,
+            (void*)s_dsd_state.audio_out_buf,
+            (void*)s_dsd_state.audio_out_float_buf,
+            (void*)s_dsd_state.cur_mp,
+            (void*)s_dsd_state.prev_mp,
+            (void*)s_dsd_state.prev_mp_enhanced);
     if (!s_dsd_state.dibit_buf || !s_dsd_state.audio_out_buf || !s_dsd_state.audio_out_float_buf ||
         !s_dsd_state.cur_mp || !s_dsd_state.prev_mp || !s_dsd_state.prev_mp_enhanced) {
-        sys_log(4, "DSD alloc FAILED"); P25.dsd_buffers_ok = false;
+        sys_log(4, "DSD alloc FAILED - one or more pointers NULL above");
+        P25.dsd_buffers_ok = false;
         esp_task_wdt_delete(NULL); vTaskDelete(NULL); return;
     }
     P25.dsd_buffers_ok = true;
+    sys_log(0, "DSD buffers_ok=true heap=%lu",
+            (unsigned long)esp_get_free_heap_size());
 
     static int16_t pcm_buf[2000];
     s_dsd_state.pcm_out_buf = pcm_buf;
@@ -136,6 +151,15 @@ static void dsd_decoder_task(void *arg)
         if (sync >= 0) {
             P25.dsd_sync_count++;
             P25.dsd_has_sync = true;
+            /* Latch the visible sync indicator for 500ms past the last
+             * sync hit. Without this, the MAIN page sees has_sync=true
+             * for only one render frame between successful syncs (TUI
+             * refreshes at 6Hz; getFrameSync may run 1-3 times/sec when
+             * working). The user sees "NO SYNC" almost continuously
+             * even when we're decoding ~15 frames over 30 seconds. The
+             * DEMOD page shows the sync count which is monotonic, so
+             * that page is fine. */
+            P25.sync_active_until_us = esp_timer_get_time() + 500000LL;
             extern int dsp_has_signal_lock;
             dsp_has_signal_lock = 1;
             P25.dsd_nac = s_dsd_state.nac;
@@ -149,6 +173,11 @@ static void dsd_decoder_task(void *arg)
             esp_task_wdt_reset();
             s_dsd_state.pcm_out_write = 0;
             processFrame(&s_dsd_opts, &s_dsd_state);
+            /* processFrame is the hot path: it calls into mbelib IMBE+
+             * synthesis which can take 50-200 ms per LDU frame on the
+             * P4 depending on PSRAM contention. Reset WDT immediately
+             * after to give the rest of this loop body fresh budget. */
+            esp_task_wdt_reset();
 
             P25.dsd_tg = s_dsd_state.lasttg;
             P25.dsd_src = s_dsd_state.lastsrc;
@@ -166,6 +195,10 @@ static void dsd_decoder_task(void *arg)
                 if (n > s_dsd_state.pcm_out_size) n = s_dsd_state.pcm_out_size;
                 if (!audio_is_muted()) {
                     audio_write_p25_voice(pcm_buf, n);
+                    /* I2S writes can block for tens of milliseconds when
+                     * the DMA queue is full. Reset WDT after to keep our
+                     * budget fresh for the next sync attempt. */
+                    esp_task_wdt_reset();
                     /* Rate-limit: voice frames fire ~50/sec when active.
                      * Log every 50th one (= roughly 1/sec) so the log
                      * page stays readable. The TUI MAIN page already
@@ -198,7 +231,12 @@ static void dsd_decoder_task(void *arg)
                 }
             }
         } else {
-            P25.dsd_has_sync = false;
+            /* Honor the latch: dsd_has_sync stays true for up to 500ms
+             * past the last hit so the MAIN page indicator doesn't
+             * flicker between every getFrameSync iteration. */
+            if (esp_timer_get_time() >= P25.sync_active_until_us) {
+                P25.dsd_has_sync = false;
+            }
             extern int dsp_has_signal_lock;
             dsp_has_signal_lock = 0;
         }

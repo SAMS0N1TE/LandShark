@@ -105,7 +105,25 @@ getFrameSync(dsd_opts *opts, dsd_state *state)
             lmin = (lbuf2[2] + lbuf2[3] + lbuf2[4]) / 3;
             lmax = (lbuf2[21] + lbuf2[20] + lbuf2[19]) / 3;
 
-            if (state->rf_mod == 1) {
+            /* Continuous min/max smoothing.
+             *
+             * Originally this only ran for QPSK (rf_mod == 1) and C4FM
+             * (rf_mod == 0) fell through the else branch which just
+             * copied state->max/min into maxref/minref WITHOUT actually
+             * updating state->max/min themselves. The result: in C4FM
+             * mode, state->max/min only ever got updated on a
+             * successful sync hit (lines below), staying stale during
+             * long hunt periods. This caused the slicer thresholds
+             * (state->umid, state->lmid) to drift too tight, so inner
+             * symbols (+1/-1 at ~±6300) got misclassified as outer
+             * (+3/-3), producing dibits that were close to the sync
+             * pattern but consistently HD=3-5 off — the exact symptom
+             * we were seeing on the LOG page (best_hd_norm=3,4,6 in
+             * SHD diagnostics, dibit_hist heavily skewed toward outer
+             * symbols).
+             *
+             * Now we smooth for both modes. */
+            if (state->rf_mod == 0 || state->rf_mod == 1) {
                 state->minbuf[state->midx] = lmin;
                 state->maxbuf[state->midx] = lmax;
                 state->midx = (state->midx == (opts->msize - 1)) ? 0 : state->midx + 1;
@@ -120,6 +138,14 @@ getFrameSync(dsd_opts *opts, dsd_state *state)
                 state->center = ((state->max) + (state->min)) / 2;
                 state->maxref = (int)((state->max) * 0.80F);
                 state->minref = (int)((state->min) * 0.80F);
+                /* Recompute slicer boundaries from freshly smoothed
+                 * min/max. Without this, umid/lmid only update on a
+                 * successful sync match, meaning the slicer uses stale
+                 * boundaries during the long hunt periods between
+                 * syncs - the very periods when accurate slicing
+                 * matters most. */
+                state->umid = (((state->max) - state->center) / 2) + state->center;
+                state->lmid = (((state->min) - state->center) / 2) + state->center;
             } else {
                 state->maxref = state->max;
                 state->minref = state->min;
@@ -181,15 +207,28 @@ getFrameSync(dsd_opts *opts, dsd_state *state)
                     if (opts->errorbars == 1)
                         printFrameSync(opts, state, " +P25p1    ", synctest_pos + 1, modulation);
                     state->lastsynctype = 0;
-                    /* Emit SYN_HIT so real syncs are still visible in UART. */
+                    /* Note: deliberately NOT setting state->synctype here.
+                     * The original working decode path runs with
+                     * synctype = -1 (default), which routes getDibit
+                     * through the secondary slicer table (lines 342-368
+                     * of dsd_dibit.c). Setting synctype to 0 was tried
+                     * and silently broke voice decode that previously
+                     * worked. The lastsynctype flag is the only handoff
+                     * needed for the secondary sync-lookahead path
+                     * below; the dibit slicer should keep its default. */
                     diag_line("SYN_HIT", "P25p1 pos=%d t=%d", synctest_pos, t);
                     return 0;
                 }
                 if (strcmp(synctest, INV_P25P1_SYNC) == 0) {
-                    /* DISABLED: With negative demod_gain, our polarity is correct
-                     * for +P25p1. Inverted syncs cause wrong dibit mapping.
-                     * Skip inverted sync entirely — it was causing NAC=0F9D errors.
-                     */
+                    /* DISABLED again: enabling this and setting
+                     * state->synctype = 1 broke a working decode path
+                     * that was producing voice. The default fall-through
+                     * (synctype = -1) is what actually produces decodable
+                     * dibits in this codebase. The merge-summary's
+                     * original disable note was correct. Leave inverted
+                     * sync detection off until we have a path that lets
+                     * us flip slicer polarity without disturbing the
+                     * thresholds the +P25p1 path depends on. */
                 }
             }
 

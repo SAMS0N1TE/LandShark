@@ -66,6 +66,12 @@ typedef struct {
     char     dsd_last_ok_duid[4];
 
     int64_t  voice_active_until_us;
+    /* Latch timestamp for the visible "SYNC" indicator on the MAIN
+     * page. dsd_has_sync stays true until this time so a sparse decode
+     * pattern (15 hits over 30 seconds) doesn't flicker the indicator
+     * off between every render frame. Set to "now+500ms" on each sync
+     * hit; the no-sync branch only clears has_sync once this expires. */
+    int64_t  sync_active_until_us;
 
     float    demod_gain;
     int      rtl_gain_tenths;

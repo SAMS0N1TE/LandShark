@@ -127,20 +127,43 @@ float diag_uptime_s(void)
 /* ── core emit ── */
 void diag_vline(const char *tag, const char *fmt, va_list ap)
 {
-    if (!s_diag_ring) return;
-    char line[DIAG_LINE_MAX];
-    int n = snprintf(line, sizeof(line), "%-4s ts=%.3f ", tag, diag_uptime_s());
-    if (n < 0 || n >= (int)sizeof(line)) return;
-    int m = vsnprintf(line + n, sizeof(line) - n - 2, fmt, ap);
+    /* Format the message body once into a scratch buffer; we use it for
+     * both the diag UART (with timestamp prefix) and the TUI mirror. */
+    char body[DIAG_LINE_MAX];
+    int  m = vsnprintf(body, sizeof(body), fmt, ap);
     if (m < 0) return;
-    if (n + m > (int)sizeof(line) - 2) m = sizeof(line) - 2 - n;
-    line[n + m]     = '\r';
-    line[n + m + 1] = '\n';
-    BaseType_t ok = xRingbufferSend(s_diag_ring, line, n + m + 2, 0 /* no block */);
-    if (ok != pdTRUE) {
-        /* In IRQ context we cannot take a mutex; just increment unlocked.
-         * One lost drop-count isn't the end of the world. */
-        s_dropped++;
+    if (m >= (int)sizeof(body)) m = (int)sizeof(body) - 1;
+
+    /* Diag UART path. */
+    if (s_diag_ring) {
+        char line[DIAG_LINE_MAX];
+        int n = snprintf(line, sizeof(line), "%-4s ts=%.3f ",
+                         tag ? tag : "?", diag_uptime_s());
+        if (n > 0 && n < (int)sizeof(line) - 2) {
+            int copy = m;
+            if (n + copy > (int)sizeof(line) - 2) copy = (int)sizeof(line) - 2 - n;
+            memcpy(line + n, body, copy);
+            line[n + copy]     = '\r';
+            line[n + copy + 1] = '\n';
+            BaseType_t ok = xRingbufferSend(s_diag_ring, line, n + copy + 2, 0);
+            if (ok != pdTRUE) s_dropped++;
+        }
+    }
+
+    /* TUI mirror: selected tags only, so the user can see frame-sync
+     * hunt diagnostics on the LOG page without hooking up the diag UART
+     * (UART1 GPIO 32). HUNT shows the dibit window vs the expected sync
+     * pattern. SHD shows the best Hamming distance per hunt period. NID
+     * shows the raw NAC/DUID dibit dump. PERIOD is the periodic counter
+     * rollup. IQR is per-second IQ level / DC / RMS. */
+    if (tag && (
+            !strcmp(tag, "HUNT")   ||
+            !strcmp(tag, "SHD")    ||
+            !strcmp(tag, "NID")    ||
+            !strcmp(tag, "PERIOD") ||
+            !strcmp(tag, "IQR"))) {
+        extern void sys_log(uint8_t color, const char *fmt, ...);
+        sys_log(0, "%s %s", tag, body);
     }
 }
 
