@@ -901,6 +901,7 @@ void tui_init(void)
            "\033[3J"        /* clear scrollback buffer       */
            "\033[r"         /* reset scroll region           */
            "\033[H"         /* home cursor                   */
+           "\033[?7l"       /* disable auto-wrap at margin    */
            "\033[?25l");    /* hide cursor (DECTCEM)         */
     fflush(stdout);
     s_dirty = true;
@@ -970,8 +971,17 @@ void tui_draw(void)
      *      where it's visually indistinguishable from the border.
      * Either way, the "cursor flying across the screen" effect is gone
      * because the cursor ends every frame in the same spot. */
+    /* Auto-wrap suppression: \033[?7l tells the terminal not to wrap
+     * the cursor to the next line when output (or local-echo of typed
+     * characters) would push past the right margin. Without this,
+     * keystrokes typed between renders get echoed at the parked
+     * position (TUI_ROWS, TUI_COLS) and then the terminal wraps them
+     * onto the next line at column 1 - which is exactly the "leak
+     * character on the inner left border" that has been visible since
+     * the keymap was added. Re-asserted every frame in case some
+     * other code path changed it. */
     tui_goto(TUI_ROWS, TUI_COLS);
-    printf("\033[?25l");
+    printf("\033[?7l\033[?25l");
 
     fflush(stdout);
 }
