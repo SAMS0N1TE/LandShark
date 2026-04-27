@@ -27,7 +27,7 @@ The TUI has four pages: a per-app MAIN page (different content for each app), a 
 ## What's a work in progress
 
 #Note
-This project is a fresh merge between two other projects of mine that were mostly test runs. Currently much of this may not work. As of typing this (4/26/2026), I have not verified ADS-B functionality. [The ADS-B only project you can find here.](https://github.com/SAMS0N1TE/esp32p4-rtl-sdr-v4)
+This project is a fresh merge between two other projects of mine that were mostly test runs. Currently much of this may not work. [The ADS-B only project you can find here.](https://github.com/SAMS0N1TE/esp32p4-rtl-sdr-v4)
 
 Sync isn't reliably hitting on real P25 signals at low input levels. With a stronger signal or AGC it should work, but the demod is sensitive to gain and the signal path matters a lot. I'm still figuring out the right gain/antenna combo for VHF reception in central NH.
 
