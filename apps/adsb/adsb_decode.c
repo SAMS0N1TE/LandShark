@@ -231,15 +231,88 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         }
     }
 
-    if (mm->altitude)         a->altitude    = mm->altitude;
-    if (mm->heading_is_valid) a->heading     = mm->heading;
-    if (mm->velocity)         a->velocity    = mm->velocity;
-    if (mm->ew_velocity)
-        a->ew_velocity = mm->ew_dir ? -mm->ew_velocity : mm->ew_velocity;
-    if (mm->ns_velocity)
-        a->ns_velocity = mm->ns_dir ? -mm->ns_velocity : mm->ns_velocity;
-    if (mm->vert_rate)
-        a->vert_rate = mm->vert_rate_sign ? -mm->vert_rate : mm->vert_rate;
+    /* Sanity-filter decoded fields. Mode-S CRC is 24 bits but the
+     * library brute-forces single-bit-flip fixes for DF11/DF17 (and
+     * two-bit fixes in aggressive mode), which means a small fraction
+     * of "CRC-passing" messages have garbled non-CRC fields — the
+     * flipped bit was the wrong one. Without bounds the renderer
+     * latches onto values like velocity=1208130444 and vert_rate=
+     * -1208163212 that flicker against the real values.
+     *
+     * Filter strategy:
+     *   1. Hard physical bounds — anything outside is decode garbage.
+     *   2. Confirmation for big jumps — a single field-update has to
+     *      agree with one prior identical-direction read, so a single
+     *      stray decode can't replace an established value.
+     *
+     * State for confirmation lives on the aircraft struct (pending_*
+     * fields). pending_count is a small saturating counter — once a
+     * value is confirmed (count >= 2) it commits, else it's tentative
+     * and the renderer keeps the prior committed value. */
+
+    if (mm->altitude) {
+        int v = mm->altitude;
+        if (v >= -1000 && v <= 60000) {
+            int prev = a->altitude;
+            int delta = v > prev ? v - prev : prev - v;
+            if (prev == 0 || delta < 5000 || a->pending_alt == v) {
+                a->altitude = v;
+                a->pending_alt = 0;
+            } else {
+                a->pending_alt = v;
+            }
+        }
+    }
+    if (mm->heading_is_valid) {
+        int v = mm->heading;
+        if (v >= 0 && v <= 359) {
+            int prev = a->heading;
+            int delta = v > prev ? v - prev : prev - v;
+            if (delta > 180) delta = 360 - delta;
+            if (prev == 0 || delta < 90 || a->pending_hdg == v) {
+                a->heading = v;
+                a->pending_hdg = 0;
+            } else {
+                a->pending_hdg = v;
+            }
+        }
+    }
+    if (mm->velocity) {
+        int v = mm->velocity;
+        if (v > 0 && v <= 1500) {
+            int prev = a->velocity;
+            int delta = v > prev ? v - prev : prev - v;
+            if (prev == 0 || delta < 200 || a->pending_vel == v) {
+                a->velocity = v;
+                a->pending_vel = 0;
+            } else {
+                a->pending_vel = v;
+            }
+        }
+    }
+    if (mm->ew_velocity) {
+        int v = mm->ew_dir ? -mm->ew_velocity : mm->ew_velocity;
+        if (v >= -1500 && v <= 1500) a->ew_velocity = v;
+    }
+    if (mm->ns_velocity) {
+        int v = mm->ns_dir ? -mm->ns_velocity : mm->ns_velocity;
+        if (v >= -1500 && v <= 1500) a->ns_velocity = v;
+    }
+    if (mm->vert_rate) {
+        int v = mm->vert_rate_sign ? -mm->vert_rate : mm->vert_rate;
+        /* Spec field is 9 bits with 64 fpm resolution → ±32768 fpm
+         * theoretical, but real aircraft top out near ±6000 fpm. */
+        if (v >= -10000 && v <= 10000) {
+            int prev = a->vert_rate;
+            int delta = v > prev ? v - prev : prev - v;
+            if (prev == 0 || delta < 2000 || a->pending_vs == v) {
+                a->vert_rate = v;
+                a->pending_vs = 0;
+            } else {
+                a->pending_vs = v;
+            }
+        }
+    }
 
     /* Real-time gate: a contact is announced after GATE_MIN_MSGS good msgs
      * within GATE_WINDOW_US of first sight, OR after the window expires
@@ -338,4 +411,78 @@ void adsb_periodic_age(int64_t now_us)
 {
     adsb_state_age_out(now_us, LOST_TIMEOUT_US, on_lost, on_late_announce);
     perf_set_active_count(adsb_state_active_count());
+}
+
+/* Synthetic aircraft injection — exercises the whole event pipeline
+ * without needing RF or a live aircraft. Generates a plausible track
+ * sample (ICAO, callsign, position, alt, vel, heading, vs) and runs
+ * it through the same code paths real decodes use:
+ *
+ *   adsb_state_find_or_create  → table slot, render row
+ *   emit_contact_event(NEW)    → first-sight event
+ *   emit_contact_event(IDENT)  → callsign published
+ *   emit_contact_event(CONFIRMED) → audio "new contact" + JSONL
+ *   emit_contact_event(POSITION/ALTITUDE/VELOCITY) → field updates
+ *
+ * Each call rotates the ICAO and tweaks position/altitude/heading so
+ * the consumer sees a moving track instead of a static row. After ~16
+ * calls the table fills (ADSB_MAX_TRACKED) and oldest entries age out
+ * normally via adsb_periodic_age. */
+void adsb_inject_fake_aircraft(void)
+{
+    static int s_test_seq = 0;
+
+    /* Synthetic ICAO range chosen to not collide with any real
+     * registered allocation block — Mode-S codes are 24-bit and the
+     * range below 0x000100 is administratively reserved / unused. */
+    uint32_t icao = 0x0000A0u + (uint32_t)(s_test_seq & 0x0F);
+
+    adsb_aircraft_t *a = adsb_state_find_or_create(icao);
+    if (!a) return;
+
+    int64_t now = esp_timer_get_time();
+    bool first_msg = (a->msg_count == 0);
+
+    if (first_msg) emit_contact_event(EVT_CONTACT_NEW, a, false);
+
+    a->last_seen_us = now;
+    a->msg_count++;
+    a->good_msg_count++;
+
+    /* Callsign: TEST<NNNN>. Modulo 10000 keeps the format inside the
+     * 8-char callsign buffer (4 letters + 4 digits + NUL = 9). */
+    snprintf(a->callsign, sizeof(a->callsign), "TEST%04u",
+             (unsigned)(s_test_seq % 10000));
+
+    /* Position: Laconia NH baseline, drift a bit each call so the
+     * track looks alive on a map. ~0.01 deg ≈ 1 km per step. */
+    a->lat = 43.5286f + 0.005f * ((float)((s_test_seq * 7) % 21) - 10.0f);
+    a->lon = -71.4703f + 0.005f * ((float)((s_test_seq * 11) % 21) - 10.0f);
+    a->pos_valid = true;
+
+    a->altitude  = 5000 + ((s_test_seq * 250) % 30000);
+    a->velocity  = 200 + ((s_test_seq * 13) % 200);
+    a->heading   = (s_test_seq * 23) % 360;
+    a->vert_rate = -1500 + ((s_test_seq * 137) % 3000);
+
+    /* Push every field-update event the parser knows about so the
+     * host can verify each branch of its dispatch table. */
+    if (first_msg) {
+        emit_contact_event(EVT_CONTACT_IDENT, a, false);
+        emit_contact_event(EVT_CONTACT_CONFIRMED, a, false);
+        a->announced = true;
+        a->first_seen_us = now;
+        audio_events_publish(AUDIO_EVT_NEW_CONTACT, icao, a->callsign, false);
+    }
+    emit_contact_event(EVT_CONTACT_POSITION, a, false);
+    emit_contact_event(EVT_CONTACT_ALTITUDE, a, false);
+    emit_contact_event(EVT_CONTACT_VELOCITY, a, false);
+
+    /* Bump the global perf counters too — a "test" message should
+     * still show up in MSGS / CRC stats so the user sees something
+     * obvious flip in the TUI header line. */
+    perf_count_msg_good();
+    perf_set_active_count(adsb_state_active_count());
+
+    s_test_seq++;
 }

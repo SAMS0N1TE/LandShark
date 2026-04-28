@@ -92,6 +92,25 @@ static void adsb_on_exit(void)
     }
 }
 
+static void adsb_on_key(tui_key_t k)
+{
+    int kk = (int)k;
+    switch (kk) {
+    case 't': case 'T':
+        /* Inject a synthetic aircraft. Useful for testing host-side
+         * JSONL consumers (the CartoTUI sidebar, dump1090 forwarders,
+         * a logger) without a live RF signal. Each press creates or
+         * updates one of 16 rotating fake tracks; the first press of
+         * a fresh ICAO publishes NEW + IDENT + CONFIRMED, every press
+         * pushes POSITION/ALTITUDE/VELOCITY updates for that track. */
+        adsb_inject_fake_aircraft();
+        ESP_LOGI(TAG, "test: injected fake aircraft");
+        break;
+    default:
+        break;
+    }
+}
+
 static const app_t ADSB_APP = {
     .name         = "ADS-B",
     .default_freq = 1090000000UL,
@@ -108,7 +127,7 @@ static const app_t ADSB_APP = {
     .draw_main    = NULL,
 #endif
     .draw_signal  = NULL,   /* use framework default Mode-S analyzer */
-    .on_key       = NULL,
+    .on_key       = adsb_on_key,
 };
 
 const app_t *adsb_app_desc(void) { return &ADSB_APP; }

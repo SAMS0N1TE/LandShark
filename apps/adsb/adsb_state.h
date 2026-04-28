@@ -45,6 +45,17 @@ typedef struct {
     int              crc_err_count;
     bool             announced;
 
+    /* Pending values awaiting confirmation. When a decoded field jumps
+     * far from the established value we don't commit it — we stash it
+     * here, and only promote to the live field if the next decode
+     * agrees. Single bad messages get filtered; sustained changes
+     * (e.g., aircraft actually turning) commit on the second read.
+     * Zero means "no pending change". */
+    int              pending_alt;
+    int              pending_vel;
+    int              pending_hdg;
+    int              pending_vs;
+
     adsb_cpr_frame_t cpr_even;
     adsb_cpr_frame_t cpr_odd;
 } adsb_aircraft_t;
