@@ -90,6 +90,18 @@ static int cpr_nl(double lat)
     return 1;
 }
 
+/* C's fmod follows the dividend's sign; CPR needs MOD that always
+ * returns a non-negative result in [0, m). Without this, an aircraft
+ * whose decoded `j` is negative (a function of the bit pattern, not
+ * the hemisphere) gets pulled into the wrong CPR cell and the lat/lon
+ * either fail the NL check or come out off-by-360. */
+static double cpr_mod(double a, double b)
+{
+    double r = fmod(a, b);
+    if (r < 0) r += b;
+    return r;
+}
+
 static bool cpr_decode(adsb_aircraft_t *a)
 {
     if (!a->cpr_even.valid || !a->cpr_odd.valid) return false;
@@ -106,8 +118,8 @@ static bool cpr_decode(adsb_aircraft_t *a)
     double dlat1 = 360.0 / 59.0;
     double j     = floor(59.0 * rlat0 - 60.0 * rlat1 + 0.5);
 
-    double lat0 = dlat0 * (fmod(j, 60.0) + rlat0);
-    double lat1 = dlat1 * (fmod(j, 59.0) + rlat1);
+    double lat0 = dlat0 * (cpr_mod(j, 60.0) + rlat0);
+    double lat1 = dlat1 * (cpr_mod(j, 59.0) + rlat1);
     if (lat0 >= 270.0) lat0 -= 360.0;
     if (lat1 >= 270.0) lat1 -= 360.0;
     if (cpr_nl(lat0) != cpr_nl(lat1)) return false;
@@ -122,8 +134,16 @@ static bool cpr_decode(adsb_aircraft_t *a)
     dlon = 360.0 / (nl > 0 ? nl : 1);
 
     double m   = floor(rlon0 * (cpr_nl(lat) - 1) - rlon1 * cpr_nl(lat) + 0.5);
-    double lon = dlon * (fmod(m, (nl > 0 ? nl : 1)) + rlon);
+    double lon = dlon * (cpr_mod(m, (double)(nl > 0 ? nl : 1)) + rlon);
     if (lon >= 180.0) lon -= 360.0;
+
+    /* Reject decodes that fell outside the valid Earth range. The math
+     * can still produce these when the input CPR pair has a bit error
+     * in the unprotected payload (CRC passed via single-bit fix on the
+     * wrong bit). Without this guard pos_valid latches onto bogus
+     * positions and the renderer never recovers. */
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0)
+        return false;
 
     a->lat = (float)lat;
     a->lon = (float)lon;
@@ -241,22 +261,28 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
      *
      * Filter strategy:
      *   1. Hard physical bounds — anything outside is decode garbage.
-     *   2. Confirmation for big jumps — a single field-update has to
-     *      agree with one prior identical-direction read, so a single
-     *      stray decode can't replace an established value.
+     *   2. First good decode commits, so weak-signal aircraft with
+     *      only one or two messages still show data.
+     *   3. After that, big jumps require a second read within a
+     *      tolerance window before they replace the established value.
+     *      Tolerance instead of exact match is essential because real
+     *      ADS-B values jitter by a few units between reads (altitude
+     *      in 25 ft steps, etc.) and exact-match confirmation will
+     *      almost never fire.
      *
-     * State for confirmation lives on the aircraft struct (pending_*
-     * fields). pending_count is a small saturating counter — once a
-     * value is confirmed (count >= 2) it commits, else it's tentative
-     * and the renderer keeps the prior committed value. */
+     * State for confirmation lives on the aircraft struct (pending_*).
+     * Zero means "no pending change". */
 
     if (mm->altitude) {
         int v = mm->altitude;
         if (v >= -1000 && v <= 60000) {
             int prev = a->altitude;
             int delta = v > prev ? v - prev : prev - v;
-            if (prev == 0 || delta < 5000 || a->pending_alt == v) {
+            int pdelta = v > a->pending_alt ? v - a->pending_alt : a->pending_alt - v;
+            if (!a->alt_valid || delta < 5000 ||
+                (a->pending_alt != 0 && pdelta <= 200)) {
                 a->altitude = v;
+                a->alt_valid = true;
                 a->pending_alt = 0;
             } else {
                 a->pending_alt = v;
@@ -269,8 +295,12 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             int prev = a->heading;
             int delta = v > prev ? v - prev : prev - v;
             if (delta > 180) delta = 360 - delta;
-            if (prev == 0 || delta < 90 || a->pending_hdg == v) {
+            int pdelta = v > a->pending_hdg ? v - a->pending_hdg : a->pending_hdg - v;
+            if (pdelta > 180) pdelta = 360 - pdelta;
+            if (!a->hdg_valid || delta < 90 ||
+                (a->pending_hdg != 0 && pdelta <= 30)) {
                 a->heading = v;
+                a->hdg_valid = true;
                 a->pending_hdg = 0;
             } else {
                 a->pending_hdg = v;
@@ -282,8 +312,11 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         if (v > 0 && v <= 1500) {
             int prev = a->velocity;
             int delta = v > prev ? v - prev : prev - v;
-            if (prev == 0 || delta < 200 || a->pending_vel == v) {
+            int pdelta = v > a->pending_vel ? v - a->pending_vel : a->pending_vel - v;
+            if (!a->vel_valid || delta < 200 ||
+                (a->pending_vel != 0 && pdelta <= 25)) {
                 a->velocity = v;
+                a->vel_valid = true;
                 a->pending_vel = 0;
             } else {
                 a->pending_vel = v;
@@ -305,8 +338,11 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         if (v >= -10000 && v <= 10000) {
             int prev = a->vert_rate;
             int delta = v > prev ? v - prev : prev - v;
-            if (prev == 0 || delta < 2000 || a->pending_vs == v) {
+            int pdelta = v > a->pending_vs ? v - a->pending_vs : a->pending_vs - v;
+            if (!a->vs_valid || delta < 2000 ||
+                (a->pending_vs != 0 && pdelta <= 500)) {
                 a->vert_rate = v;
+                a->vs_valid = true;
                 a->pending_vs = 0;
             } else {
                 a->pending_vs = v;
@@ -338,8 +374,11 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             audio_events_publish(AUDIO_EVT_NEW_CONTACT, icao, a->callsign, false);
     }
 
-    if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18 &&
-        mm->raw_latitude != 0) {
+    if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18) {
+        /* raw_lat/raw_lon are 17-bit unsigned CPR values; zero is a
+         * valid encoded coordinate, not a "missing field" sentinel.
+         * Earlier code checked != 0 here and silently dropped legitimate
+         * frames, occasionally blocking even/odd pairing forever. */
         int64_t ts = esp_timer_get_time();
         if (mm->fflag == 0)
             a->cpr_even = (adsb_cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, true };
@@ -464,6 +503,7 @@ void adsb_inject_fake_aircraft(void)
     a->velocity  = 200 + ((s_test_seq * 13) % 200);
     a->heading   = (s_test_seq * 23) % 360;
     a->vert_rate = -1500 + ((s_test_seq * 137) % 3000);
+    a->alt_valid = a->vel_valid = a->hdg_valid = a->vs_valid = true;
 
     /* Push every field-update event the parser knows about so the
      * host can verify each branch of its dispatch table. */

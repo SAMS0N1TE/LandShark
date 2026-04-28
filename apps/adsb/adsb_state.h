@@ -45,12 +45,23 @@ typedef struct {
     int              crc_err_count;
     bool             announced;
 
+    /* Per-field "has been decoded at least once" flags. The renderer
+     * uses these to print '--' for fields that never came in (e.g. a
+     * Mode-S-only transponder sending no BDS09 has no velocity or
+     * heading), instead of misleadingly printing zero-init values as
+     * if they were data. */
+    bool             alt_valid;
+    bool             vel_valid;
+    bool             hdg_valid;
+    bool             vs_valid;
+
     /* Pending values awaiting confirmation. When a decoded field jumps
      * far from the established value we don't commit it — we stash it
      * here, and only promote to the live field if the next decode
-     * agrees. Single bad messages get filtered; sustained changes
-     * (e.g., aircraft actually turning) commit on the second read.
-     * Zero means "no pending change". */
+     * agrees within a tolerance window (see update_filtered() in
+     * adsb_decode.c). Single bad messages get filtered; sustained
+     * changes commit on the second matching read. Zero means "no
+     * pending change". */
     int              pending_alt;
     int              pending_vel;
     int              pending_hdg;

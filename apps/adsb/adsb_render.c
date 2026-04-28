@@ -48,12 +48,23 @@ void adsb_draw_main(int top, int rows, int cols)
 
         const char *alt_col = C_TEXT;
         const char *vs_col  = C_DIM;
-        char vs_buf[12] = "  --";
-        if (a->vert_rate > 200) {
+        char vs_buf[12]  = "  --";
+        char alt_buf[12] = "      --";
+        char vel_buf[12] = "    --";
+        char hdg_buf[12] = "   --";
+
+        if (a->alt_valid)
+            snprintf(alt_buf, sizeof(alt_buf), "%8d", a->altitude);
+        if (a->vel_valid)
+            snprintf(vel_buf, sizeof(vel_buf), "%6d", a->velocity);
+        if (a->hdg_valid)
+            snprintf(hdg_buf, sizeof(hdg_buf), "%5d", a->heading);
+
+        if (a->vs_valid && a->vert_rate > 200) {
             alt_col = C_GREEN;
             vs_col  = C_GREEN;
             snprintf(vs_buf, sizeof(vs_buf), "+%d", a->vert_rate);
-        } else if (a->vert_rate < -200) {
+        } else if (a->vs_valid && a->vert_rate < -200) {
             alt_col = C_AMBER;
             vs_col  = C_AMBER;
             snprintf(vs_buf, sizeof(vs_buf), "%d", a->vert_rate);
@@ -71,16 +82,16 @@ void adsb_draw_main(int top, int rows, int cols)
         tui_goto(body_row, 3);
         printf(C_CYAN  "%-8lX" RESET " "
                C_GOLD  "%-9s" RESET " "
-               "%s%8d" RESET " "
-               C_TEXT  "%6d" RESET " "
-               C_MAGENTA "%5d" RESET " "
+               "%s%8s" RESET " "
+               C_TEXT  "%6s" RESET " "
+               C_MAGENTA "%5s" RESET " "
                C_DIM   "%9s" RESET " "
                C_DIM   "%9s" RESET " "
                "%s%6s" RESET " "
                C_DIM   "%5d" RESET EL,
                (unsigned long)a->icao,
-               cs, alt_col, a->altitude,
-               a->velocity, a->heading,
+               cs, alt_col, alt_buf,
+               vel_buf, hdg_buf,
                lat_s, lon_s,
                vs_col, vs_buf, a->msg_count);
         body_row++;
