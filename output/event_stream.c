@@ -4,9 +4,39 @@
  * the system console; printing JSONL there would interleave with screen
  * redraws and log output, making the stream unparseable.
  *
- * UART2 / TX = GPIO 17, 115200 8N1. Wire that pin to the host's RX and
- * read directly. Each record is prefixed with 0x1E (ASCII RS) and ends
- * with 0x0A (LF) so a reader can resync mid-stream if it joins late. */
+ * UART2 / TX = configurable via Kconfig (default GPIO 3), 115200 8N1.
+ * Wire that pin to the host's RX and read directly. Each record is
+ * framed as: 0x1E (ASCII RS) ... JSON body ... 0x0A (LF). The RS
+ * prefix lets a reader resync mid-stream if it joins late, and the LF
+ * terminates the record so line-oriented parsers (jq -c, NDJSON tools)
+ * also work.
+ *
+ * Concurrency model:
+ *   - event_bus already serialises subscriber callbacks under its own
+ *     mutex, so on_event() runs single-threaded with respect to other
+ *     bus subscribers. We take a *second* mutex around every actual
+ *     uart_write_bytes() call so that:
+ *       (a) the boot banner can't splice into the first heartbeat if
+ *           init races with an early publish,
+ *       (b) any future direct-emit caller (a CLI, a watchdog dump,
+ *           etc.) can't interleave a partial line with an in-flight
+ *           bus emit, and
+ *       (c) the framing bytes (RS, JSON body, LF) for a single record
+ *           are guaranteed contiguous on the wire even if the body
+ *           write blocks on a full TX buffer.
+ *     Defence in depth - cheap, and it directly addresses the
+ *     "frame truncated mid-string then next frame slammed in with no
+ *     separator" symptom seen in v9 captures.
+ *
+ * Framing robustness:
+ *   - RS (0x1E) and LF (0x0A) are written as separate, explicit byte
+ *     sequences around the JSON body rather than embedded inside the
+ *     snprintf format string. snprintf is not actually the failure
+ *     mode here, but pulling the framing bytes out of the format
+ *     string makes them impossible to lose to a future refactor that
+ *     truncates the body buffer. The body write and the trailing LF
+ *     write happen under the same mutex hold, so they can't be
+ *     separated by another writer. */
 
 #include "event_stream.h"
 #include "event_bus.h"
@@ -15,6 +45,8 @@
 #include "sdkconfig.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #ifndef CONFIG_OUTPUT_EVENT_STREAM_UART_NUM
 #define CONFIG_OUTPUT_EVENT_STREAM_UART_NUM  2
@@ -28,32 +60,53 @@
 #define STREAM_UART_BAUD    115200
 #define STREAM_LINE_MAX     384
 
-#define RS "\x1e"
+/* Framing bytes pulled out of format strings so they can never be
+ * accidentally truncated, escaped, or stripped by an intermediate
+ * processing step. */
+static const char FRAME_RS[1] = { 0x1E };
+static const char FRAME_LF[1] = { 0x0A };
 
 static bool s_uart_ready = false;
 
-static void emit_str(const char *buf, int len)
+/* Device-level write mutex. See concurrency notes at top of file. */
+static SemaphoreHandle_t s_tx_mux = NULL;
+
+/* Write a single record: RS prefix, body, LF terminator. The three
+ * writes happen under the same mutex hold so the record is atomic
+ * with respect to any other emit_record() caller. uart_write_bytes()
+ * blocks if the TX ring buffer is full, but blocking inside the lock
+ * is fine - other emitters wait, the wire drains, we proceed. */
+static void emit_record(const char *body, int body_len)
 {
-    if (!s_uart_ready || len <= 0) return;
-    uart_write_bytes(STREAM_UART_NUM, buf, len);
+    if (!s_uart_ready || body_len <= 0) return;
+
+    if (s_tx_mux) xSemaphoreTake(s_tx_mux, portMAX_DELAY);
+
+    uart_write_bytes(STREAM_UART_NUM, FRAME_RS, sizeof(FRAME_RS));
+    uart_write_bytes(STREAM_UART_NUM, body,     body_len);
+    uart_write_bytes(STREAM_UART_NUM, FRAME_LF, sizeof(FRAME_LF));
+
+    if (s_tx_mux) xSemaphoreGive(s_tx_mux);
 }
 
 static void emit_contact(const event_t *e)
 {
     char buf[STREAM_LINE_MAX];
     const evt_contact_t *c = &e->u.contact;
+    /* Body only - framing is added by emit_record(). */
     int n = snprintf(buf, sizeof(buf),
-        RS "{\"t\":%lld,\"k\":\"%s\",\"app\":\"%s\","
+        "{\"t\":%lld,\"k\":\"%s\",\"app\":\"%s\","
         "\"icao\":\"%06lX\",\"cs\":\"%s\","
         "\"alt\":%d,\"vel\":%d,\"hdg\":%d,\"vs\":%d,"
-        "\"lat\":%.5f,\"lon\":%.5f,\"pos\":%s,\"shaky\":%s}\n",
+        "\"lat\":%.5f,\"lon\":%.5f,\"pos\":%s,\"shaky\":%s}",
         (long long)e->ts_us, evt_kind_name(e->kind), e->app,
         (unsigned long)c->icao, c->callsign,
         c->altitude, c->velocity, c->heading, c->vert_rate,
         c->lat, c->lon,
         c->pos_valid ? "true" : "false",
         c->crc_shaky ? "true" : "false");
-    emit_str(buf, n);
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    emit_record(buf, n);
 }
 
 static void emit_heartbeat(const event_t *e)
@@ -61,34 +114,37 @@ static void emit_heartbeat(const event_t *e)
     char buf[STREAM_LINE_MAX];
     const evt_heartbeat_t *h = &e->u.hb;
     int n = snprintf(buf, sizeof(buf),
-        RS "{\"t\":%lld,\"k\":\"%s\",\"app\":\"%s\","
+        "{\"t\":%lld,\"k\":\"%s\",\"app\":\"%s\","
         "\"bps\":%lu,\"msgs\":%d,\"mps\":%d,"
         "\"crc_good\":%d,\"crc_err\":%d,\"ac\":%d,"
-        "\"mag_avg\":%d,\"mag_peak\":%d}\n",
+        "\"mag_avg\":%d,\"mag_peak\":%d}",
         (long long)e->ts_us, evt_kind_name(e->kind), e->app,
         (unsigned long)h->bytes_per_sec, h->msgs_total, h->msgs_per_sec,
         h->crc_good, h->crc_err, h->active_count,
         h->mag_avg, h->mag_peak);
-    emit_str(buf, n);
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    emit_record(buf, n);
 }
 
 static void emit_app_switch(const event_t *e)
 {
     char buf[STREAM_LINE_MAX];
     int n = snprintf(buf, sizeof(buf),
-        RS "{\"t\":%lld,\"k\":\"%s\",\"from\":\"%s\",\"to\":\"%s\"}\n",
+        "{\"t\":%lld,\"k\":\"%s\",\"from\":\"%s\",\"to\":\"%s\"}",
         (long long)e->ts_us, evt_kind_name(e->kind),
         e->u.sw.from, e->u.sw.to);
-    emit_str(buf, n);
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    emit_record(buf, n);
 }
 
 static void emit_simple(const event_t *e)
 {
     char buf[STREAM_LINE_MAX];
     int n = snprintf(buf, sizeof(buf),
-        RS "{\"t\":%lld,\"k\":\"%s\",\"app\":\"%s\"}\n",
+        "{\"t\":%lld,\"k\":\"%s\",\"app\":\"%s\"}",
         (long long)e->ts_us, evt_kind_name(e->kind), e->app);
-    emit_str(buf, n);
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    emit_record(buf, n);
 }
 
 static void on_event(const event_t *e, void *user)
@@ -127,6 +183,17 @@ static void on_event(const event_t *e, void *user)
 
 void event_stream_init(void)
 {
+    /* Mutex first - emit_record() checks for it but it must exist
+     * before any subscriber callback can fire. Created idempotently. */
+    if (!s_tx_mux) {
+        s_tx_mux = xSemaphoreCreateMutex();
+        if (!s_tx_mux) {
+            ESP_LOGE("event_stream", "tx mutex create failed");
+            /* Continue without mutex - bus serialisation alone covers
+             * the common case; we just lose defence in depth. */
+        }
+    }
+
     if (!uart_is_driver_installed(STREAM_UART_NUM)) {
         const uart_config_t cfg = {
             .baud_rate  = STREAM_UART_BAUD,
@@ -155,12 +222,18 @@ void event_stream_init(void)
     if (s_uart_ready) {
         /* Banner: confirms the wire is hot the moment the host opens
          * the port. Also gives a parseable "I'm alive" line so the
-         * consumer can wait for it before processing further events. */
+         * consumer can wait for it before processing further events.
+         * Goes through emit_record() so it gets the same RS/LF
+         * framing and mutex protection as every other line - meaning
+         * the banner can never splice into a heartbeat that fires
+         * during init. Kind name is uppercase to match the schema
+         * convention used by every other event. */
         char banner[128];
         int n = snprintf(banner, sizeof(banner),
-            "\x1e{\"k\":\"stream_init\",\"uart\":%d,\"tx_gpio\":%d,\"baud\":%d}\n",
+            "{\"k\":\"STREAM_INIT\",\"uart\":%d,\"tx_gpio\":%d,\"baud\":%d}",
             STREAM_UART_NUM, STREAM_UART_TX_PIN, STREAM_UART_BAUD);
-        uart_write_bytes(STREAM_UART_NUM, banner, n);
+        if (n >= (int)sizeof(banner)) n = (int)sizeof(banner) - 1;
+        emit_record(banner, n);
 
         ESP_LOGI("event_stream",
                  "JSONL on UART%d TX=GPIO%d %d 8N1",
