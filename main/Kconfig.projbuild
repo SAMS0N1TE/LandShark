@@ -41,11 +41,32 @@ menu "ESP32-P4 SDR Tool"
             default n
             help
                 Emits one JSON object per line for every published event
-                (new contact, lost contact, position fix, etc). Designed
-                for a host SBC or PC to consume programmatically. Each
-                line is prefixed with a single-byte marker (ASCII 0x1E)
-                so it can be cleanly demuxed from human log output if
-                both are enabled on the same UART.
+                (new contact, lost contact, position fix, etc) on a
+                dedicated UART. Each line is prefixed with ASCII 0x1E
+                and ends with LF so a host can resync mid-stream.
+
+        config OUTPUT_EVENT_STREAM_UART_NUM
+            int "Event stream UART number (0-4)"
+            depends on OUTPUT_EVENT_STREAM
+            default 2
+            range 0 4
+            help
+                Which HP UART to use. UART0 is the console (TUI/log) -
+                don't pick that. UART1 is the P25 diag channel (GPIO 32) -
+                don't pick that either if P25_DIAG_UART is enabled.
+                UART2 is a safe default.
+
+        config OUTPUT_EVENT_STREAM_TX_GPIO
+            int "Event stream TX GPIO"
+            depends on OUTPUT_EVENT_STREAM
+            default 17
+            range 0 54
+            help
+                GPIO pin for the event stream UART TX. ESP32-P4 caveats:
+                stay at 36 or lower to avoid LDO power-domain issues
+                with higher GPIOs. Avoid 24/25 (USB-JTAG), 34-38
+                (strapping pins), 46 (USB VBUS enable on this firmware),
+                and 32 (P25 diag UART). Wire this pin to your host's RX.
 
     endmenu
 
