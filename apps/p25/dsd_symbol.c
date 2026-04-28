@@ -403,10 +403,11 @@ getSymbol(dsd_opts *opts, dsd_state *state, int have_sync)
             }
         }
 
-        if ((sample > state->max) && (have_sync == 1) && (state->rf_mod == 0))
-            sample = state->max;
-        else if ((sample < state->min) && (have_sync == 1) && (state->rf_mod == 0))
-            sample = state->min;
+        /* Removed: post-sync sample clamp to state->max/min.
+         * state->max is itself a 15-frame rolling avg of lmax. Clamping
+         * samples to it before they feed use_symbol creates a feedback
+         * loop where state->max can never grow past its current value,
+         * locking outer +3 symbols (~19000) down to the seeded ~6700. */
 
         if (sample > state->center) {
             if (state->lastsample < state->center)

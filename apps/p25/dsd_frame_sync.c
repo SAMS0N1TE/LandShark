@@ -207,16 +207,21 @@ getFrameSync(dsd_opts *opts, dsd_state *state)
                     if (opts->errorbars == 1)
                         printFrameSync(opts, state, " +P25p1    ", synctest_pos + 1, modulation);
                     state->lastsynctype = 0;
-                    /* Note: deliberately NOT setting state->synctype here.
-                     * The original working decode path runs with
-                     * synctype = -1 (default), which routes getDibit
-                     * through the secondary slicer table (lines 342-368
-                     * of dsd_dibit.c). Setting synctype to 0 was tried
-                     * and silently broke voice decode that previously
-                     * worked. The lastsynctype flag is the only handoff
-                     * needed for the secondary sync-lookahead path
-                     * below; the dibit slicer should keep its default. */
+                    state->synctype     = 0;
+                    /* synctype=0 enables the gate at dsd_main.c:307 that
+                     * routes IMBE codewords to mbe_processImbe7200x4400Framef.
+                     * Without it, voice frames go to processMbeFrame but
+                     * the IMBE decoder is never called, leaving
+                     * audio_out_temp_buf at zeros so playback is silent.
+                     * Earlier comment warned this broke decoding; in this
+                     * codebase the only synctype-gated slicer path is the
+                     * heuristics block in dsd_dibit.c which is wrapped in
+                     * `if (0 && ...)` so synctype 0 vs -1 produces the
+                     * same dibit decisions. */
                     diag_line("SYN_HIT", "P25p1 pos=%d t=%d", synctest_pos, t);
+                    diag_line("SLICE", "lock min=%d max=%d center=%d lmid=%d umid=%d lmax_in=%d lmin_in=%d",
+                              state->min, state->max, state->center,
+                              state->lmid, state->umid, lmax, lmin);
                     return 0;
                 }
                 if (strcmp(synctest, INV_P25P1_SYNC) == 0) {
@@ -245,6 +250,7 @@ getFrameSync(dsd_opts *opts, dsd_state *state)
                     if (opts->errorbars == 1)
                         printFrameSync(opts, state, "(+P25p1)   ", synctest_pos + 1, modulation);
                     state->lastsynctype = -1;
+                    state->synctype     = 0;
                     return 0;
                 } else if ((state->lastsynctype == 1) && ((state->lastp25type == 1) || (state->lastp25type == 2))) {
                     state->carrier = 1;

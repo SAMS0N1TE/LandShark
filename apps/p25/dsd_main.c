@@ -150,6 +150,13 @@ void noCarrier(dsd_opts *opts, dsd_state *state)
     state->max = 15000;
     state->min = -15000;
     state->center = 0;
+    /* Reseed the rolling avg ring; otherwise stale low values from the
+     * previous acquisition drag state->max down on the next one. */
+    for (int i = 0; i < (int)(sizeof(state->minbuf)/sizeof(state->minbuf[0])); i++) {
+        state->minbuf[i] = -15000;
+        state->maxbuf[i] =  15000;
+    }
+    state->midx = 0;
     state->err_str[0] = 0;
     sprintf(state->fsubtype, "              ");
     state->errs = 0;
@@ -292,6 +299,11 @@ void processMbeFrame(dsd_opts *opts, dsd_state *state, char imbe_fr[8][23], char
     for (i = 0; i < 88; i++)
         imbe_d[i] = 0;
 
+    int imbe_ones = 0;
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 23; c++)
+            imbe_ones += (imbe_fr[r][c] & 1);
+
     if ((state->synctype == 0) || (state->synctype == 1)) {
         mbe_processImbe7200x4400Framef(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, imbe_fr, imbe_d, state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
     }
@@ -300,6 +312,21 @@ void processMbeFrame(dsd_opts *opts, dsd_state *state, char imbe_fr[8][23], char
         printf("%s", state->err_str);
 
     state->debug_audio_errors += state->errs2;
+
+    {
+        extern void diag_line(const char *tag, const char *fmt, ...);
+        static int vf_idx = 0;
+        float pcm_max = 0.0f;
+        for (int k = 0; k < 160; k++) {
+            float a = state->audio_out_temp_buf[k];
+            if (a < 0) a = -a;
+            if (a > pcm_max) pcm_max = a;
+        }
+        diag_line("VFRM", "i=%d ones=%d/184 errs=%d errs2=%d repeat=%d pcm_max=%.0f str=%.10s",
+                  vf_idx++, imbe_ones,
+                  state->errs, state->errs2,
+                  state->cur_mp->repeat, (double)pcm_max, state->err_str);
+    }
 
     processAudio(opts, state);
 }

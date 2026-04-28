@@ -195,6 +195,8 @@ void dsp_init(dsp_state_t *s)
     s->nco_phase    = 0.0;
     s->nco_step_rad = 0.0;
     s->nco_dc_avg   = 0.0;
+
+    s->c4fm_dc_avg  = 0.0f;
 }
 
 void dsp_set_mode(dsp_state_t *s, demod_mode_t mode)
@@ -1149,13 +1151,7 @@ int dsp_process_iq(dsp_state_t *s, const uint8_t *iq_data, int iq_len,
 
         if (s->mode == DEMOD_C4FM) {
             if (n_out < audio_max) {
-                /* Discriminator → matched filter → ring.
-                 *
-                 * Previously the C4FM path was: atan2 → ring, with no
-                 * symbol-shaped pulse going to the slicer. The slicer
-                 * was then operating on raw post-discriminator phase,
-                 * which at 5 sps has noise contamination on every
-                 * sample and ISI at every symbol edge.
+                /* Discriminator → matched filter → DC removal → ring.
                  *
                  * The 21-tap RRC matched filter (rrc_fsk4_filter, beta
                  * 0.2, designed for 24 kHz / 4800 baud = 5 sps) is the
@@ -1165,15 +1161,32 @@ int dsp_process_iq(dsp_state_t *s, const uint8_t *iq_data, int iq_len,
                  * in dsd_symbol.c needs to find consistent plateaus.
                  *
                  * Same buf as DEMOD_FSK4_TRACKING. Modes are mutually
-                 * exclusive at runtime so no collision; dsp_set_mode
-                 * resets the buf when entering FSK4_TRACKING, and a
-                 * brief transient on switch to C4FM is absorbed by
-                 * AGC + median within a few symbols.
+                 * exclusive at runtime so no collision.
                  *
-                 * Unity DC gain → no rescaling, and demod_gain headroom
-                 * (peak ~±28k for ±π phase × 9000) fits int16 cleanly. */
+                 * AFC: subtract running mean of post-RRC signal. RTL-SDR
+                 * crystal PPM error puts the carrier ±100-1000 Hz from
+                 * tune freq, which through fm_demod becomes a constant
+                 * DC offset proportional to the offset frequency. Without
+                 * compensation, DSD's slicer sees an asymmetric symbol
+                 * stream (e.g. center=-2200, umid=+500, lmid=-5000) and
+                 * misclassifies outer symbols as inner. Time constant
+                 * gates on dsp_has_signal_lock: 80 ms TC during hunt for
+                 * fast initial convergence, 800 ms TC once locked so
+                 * short-term symbol asymmetry within an LDU doesn't
+                 * pull the AFC. Same scheme as the FSK4_TRACKING NCO
+                 * AFC above. RRC has unity DC gain so subtracting
+                 * post-RRC mean is equivalent to subtracting a constant
+                 * pre-RRC, with better noise immunity. */
                 int16_t raw = fm_demod(s, si, sq);
                 float filt = rrc_fsk4_filter(s, (float)raw);
+
+                {
+                    extern int dsp_has_signal_lock;
+                    float c4fm_alpha = dsp_has_signal_lock ? 0.00005f : 0.0005f;
+                    s->c4fm_dc_avg += c4fm_alpha * (filt - s->c4fm_dc_avg);
+                }
+                filt -= s->c4fm_dc_avg;
+
                 if (filt >  32767.0f) filt =  32767.0f;
                 if (filt < -32767.0f) filt = -32767.0f;
                 audio_out[n_out++] = (int16_t)filt;

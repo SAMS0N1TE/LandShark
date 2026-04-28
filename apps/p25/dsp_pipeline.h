@@ -183,6 +183,17 @@ typedef struct {
     float  rrc_fsk4_buf[RRC_FSK4_TAPS];
     int    rrc_fsk4_idx;
 
+    /* DEMOD_C4FM post-discriminator DC tracker. Removes the constant
+     * phase-per-sample bias caused by RTL-SDR crystal PPM error from
+     * the post-RRC signal before it enters the DSD slicer. Without
+     * this, a 200-1000 Hz tuning error produces center=-2000 to -3000
+     * in DSD's symbol stream, asymmetrizing umid/lmid and corrupting
+     * NID dibits. The FSK4_TRACKING mode has its own NCO-based AFC
+     * (nco_dc_avg/nco_step_rad above); this is the equivalent for
+     * DEMOD_C4FM. Time constant gated on dsp_has_signal_lock: fast
+     * (80 ms) when hunting, slow (800 ms) when locked. */
+    float  c4fm_dc_avg;
+
 } dsp_state_t;
 
 void dsp_init(dsp_state_t *s);

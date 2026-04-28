@@ -147,6 +147,7 @@ static void dsd_decoder_task(void *arg)
     s_dsd_running = true;
     while (s_app_active) {
         esp_task_wdt_reset();
+        diag_emit_periodic();
         int sync = getFrameSync(&s_dsd_opts, &s_dsd_state);
         if (sync >= 0) {
             P25.dsd_sync_count++;
@@ -449,6 +450,8 @@ static void p25_rx_task(void *arg)
 static void p25_on_enter(void)
 {
     if (s_app_active) return;
+
+    diag_init();
 
     /* Clear visible state so the TUI doesn't briefly show stale numbers
      * from the previous session. */

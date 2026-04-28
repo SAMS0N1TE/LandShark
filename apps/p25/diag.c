@@ -81,6 +81,10 @@ static void diag_tx_task(void *arg)
 /* ── init ── */
 void diag_init(void)
 {
+    if (s_lock != NULL) {
+        return;
+    }
+
     s_start_us = esp_timer_get_time();
     s_last_periodic_us = s_start_us;
     memset(&s_cnt, 0, sizeof(s_cnt));
@@ -93,24 +97,28 @@ void diag_init(void)
         return;
     }
 
-    /* UART1 driver install. TX queue 0 — we drain via ring buffer ourselves. */
-    const uart_config_t cfg = {
-        .baud_rate  = DIAG_UART_BAUD,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_ERROR_CHECK(uart_driver_install(DIAG_UART_NUM, 1024, 4096, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(DIAG_UART_NUM, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(DIAG_UART_NUM,
-                                 DIAG_UART_TX_PIN, DIAG_UART_RX_PIN,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    /* UART1 driver install. TX queue 0 — we drain via ring buffer ourselves.
+     * Skip if already installed (e.g. on app re-entry). */
+    if (!uart_is_driver_installed(DIAG_UART_NUM)) {
+        const uart_config_t cfg = {
+            .baud_rate  = DIAG_UART_BAUD,
+            .data_bits  = UART_DATA_8_BITS,
+            .parity     = UART_PARITY_DISABLE,
+            .stop_bits  = UART_STOP_BITS_1,
+            .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+            .source_clk = UART_SCLK_DEFAULT,
+        };
+        if (uart_driver_install(DIAG_UART_NUM, 1024, 4096, 0, NULL, 0) == ESP_OK) {
+            uart_param_config(DIAG_UART_NUM, &cfg);
+            uart_set_pin(DIAG_UART_NUM,
+                         DIAG_UART_TX_PIN, DIAG_UART_RX_PIN,
+                         UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    /* Pin drain task to core 1 so it never fights the USB host on core 0. */
-    xTaskCreatePinnedToCore(diag_tx_task, "diag_tx", 3072, NULL,
-                            tskIDLE_PRIORITY + 2, &s_task, 1);
+            /* Pin drain task to core 1 so it never fights the USB host on core 0. */
+            xTaskCreatePinnedToCore(diag_tx_task, "diag_tx", 3072, NULL,
+                                    tskIDLE_PRIORITY + 2, &s_task, 1);
+        }
+    }
 
     /* Banner so you can confirm the UART is alive the moment you connect. */
     diag_line("BOOT", "diag_init ok uart=%d tx=%d rx=%d baud=%d",
@@ -161,6 +169,11 @@ void diag_vline(const char *tag, const char *fmt, va_list ap)
             !strcmp(tag, "SHD")    ||
             !strcmp(tag, "NID")    ||
             !strcmp(tag, "PERIOD") ||
+            !strcmp(tag, "SLICE")  ||
+            !strcmp(tag, "VFRM")   ||
+            !strcmp(tag, "DSP")    ||
+            !strcmp(tag, "OKDMP")  ||
+            !strcmp(tag, "FLDMP")  ||
             !strcmp(tag, "IQR"))) {
         extern void sys_log(uint8_t color, const char *fmt, ...);
         sys_log(0, "%s %s", tag, body);
@@ -280,13 +293,14 @@ void diag_emit_periodic(void)
               P25.ring_fill, P25.ring_size,
               P25.read_errors,
               (double)P25.iq_level);
-    diag_line("DSP",  "mode=%s agc_gain=%.2f demod_gain=%.2f rtl_gain=%.1f dc_i=%+.4f dc_q=%+.4f",
+    diag_line("DSP",  "mode=%s agc_gain=%.2f demod_gain=%.2f rtl_gain=%.1f dc_i=%+.4f dc_q=%+.4f c4fm_dc=%+.0f",
               mode_str,
               (double)s_dsp.agc_gain,
               (double)P25.demod_gain,
               (double)P25.rtl_gain_tenths / 10.0,
               (double)s_dsp.dc_avg_i,
-              (double)s_dsp.dc_avg_q);
+              (double)s_dsp.dc_avg_q,
+              (double)s_dsp.c4fm_dc_avg);
     diag_line("SYN",  "att=%d hd0=%d hd1=%d hd2=%d hd3=%d best=%d",
               snap.sync_attempts, snap.sync_exact,
               snap.sync_hd1, snap.sync_hd2, snap.sync_hd3,
