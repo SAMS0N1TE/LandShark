@@ -50,3 +50,13 @@ CONFIG_APP_PROJECT_VER="1.0.0"
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG is not set
+
+# ── Output sinks ────────────────────────────────────────────
+# Machine-readable JSONL event stream on a dedicated UART so a
+# host program (CartoTUI etc.) can parse aircraft / contact
+# events without competing with TUI escape codes on UART0.
+# UART2 with TX on GPIO 48 is the ESP32-P4-Nano default.
+# Wire GPIO 48 → host RX, GND → host GND, 115200 8N1.
+CONFIG_OUTPUT_EVENT_STREAM=y
+CONFIG_OUTPUT_EVENT_STREAM_UART_NUM=2
+CONFIG_OUTPUT_EVENT_STREAM_TX_GPIO=3
