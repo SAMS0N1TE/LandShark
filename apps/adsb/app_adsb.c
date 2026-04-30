@@ -11,7 +11,10 @@
 #include "sdkconfig.h"
 
 #ifdef CONFIG_ENABLE_TUI
+#include "tui.h"
 extern void adsb_draw_main(int top, int rows, int cols);
+extern void adsb_draw_signal(int top, int rows, int cols);
+extern void adsb_draw_diag(int top, int rows, int cols);
 extern void adsb_on_enter_tui(void);
 #endif
 
@@ -95,6 +98,41 @@ static void adsb_on_exit(void)
 static void adsb_on_key(tui_key_t k)
 {
     int kk = (int)k;
+
+#ifdef CONFIG_ENABLE_TUI
+    /* Selection navigation. The state module's adsb_select_get() will
+     * auto-select the first active aircraft on first read, so the very
+     * first ↑ or ↓ press just steps from there. Works on both PAGE_MAIN
+     * (where the chevron is visible) and PAGE_SIGNAL (where it cycles
+     * which contact's detail is shown). */
+    page_t pg = page_current();
+    if (pg == PAGE_MAIN || pg == PAGE_SIGNAL) {
+        if (kk == TK_DOWN) {
+            (void)adsb_select_get();   /* prime auto-selection */
+            adsb_select_next();
+            tui_mark_dirty();
+            return;
+        }
+        if (kk == TK_UP) {
+            (void)adsb_select_get();
+            adsb_select_prev();
+            tui_mark_dirty();
+            return;
+        }
+        if (kk == TK_ENTER && pg == PAGE_MAIN) {
+            /* Force a selection if there isn't one, then jump to the
+             * detail page. If there are no active aircraft, just
+             * silently no-op rather than landing on an empty page. */
+            const adsb_aircraft_t *sel = adsb_select_get();
+            if (sel) {
+                page_set(PAGE_SIGNAL);
+                tui_mark_dirty();
+            }
+            return;
+        }
+    }
+#endif
+
     switch (kk) {
     case 't': case 'T':
         /* Inject a synthetic aircraft. Useful for testing host-side
@@ -117,16 +155,20 @@ static const app_t ADSB_APP = {
     .default_rate = 2000000,
     .default_gain = 496,
     .banner       = "ATC TERMINAL",
-    .signal_label = "MODE-S",
+    .signal_label = "TRACK",
+    .diag_label   = "DIAG",
     .on_enter     = adsb_on_enter,
     .on_exit      = adsb_on_exit,
     .on_sample    = adsb_on_sample,
 #ifdef CONFIG_ENABLE_TUI
     .draw_main    = adsb_draw_main,
+    .draw_signal  = adsb_draw_signal,
+    .draw_diag    = adsb_draw_diag,
 #else
     .draw_main    = NULL,
+    .draw_signal  = NULL,
+    .draw_diag    = NULL,
 #endif
-    .draw_signal  = NULL,   /* use framework default Mode-S analyzer */
     .on_key       = adsb_on_key,
 };
 

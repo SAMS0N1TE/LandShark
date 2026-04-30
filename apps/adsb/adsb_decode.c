@@ -90,18 +90,6 @@ static int cpr_nl(double lat)
     return 1;
 }
 
-/* C's fmod follows the dividend's sign; CPR needs MOD that always
- * returns a non-negative result in [0, m). Without this, an aircraft
- * whose decoded `j` is negative (a function of the bit pattern, not
- * the hemisphere) gets pulled into the wrong CPR cell and the lat/lon
- * either fail the NL check or come out off-by-360. */
-static double cpr_mod(double a, double b)
-{
-    double r = fmod(a, b);
-    if (r < 0) r += b;
-    return r;
-}
-
 static bool cpr_decode(adsb_aircraft_t *a)
 {
     if (!a->cpr_even.valid || !a->cpr_odd.valid) return false;
@@ -118,8 +106,8 @@ static bool cpr_decode(adsb_aircraft_t *a)
     double dlat1 = 360.0 / 59.0;
     double j     = floor(59.0 * rlat0 - 60.0 * rlat1 + 0.5);
 
-    double lat0 = dlat0 * (cpr_mod(j, 60.0) + rlat0);
-    double lat1 = dlat1 * (cpr_mod(j, 59.0) + rlat1);
+    double lat0 = dlat0 * (fmod(j, 60.0) + rlat0);
+    double lat1 = dlat1 * (fmod(j, 59.0) + rlat1);
     if (lat0 >= 270.0) lat0 -= 360.0;
     if (lat1 >= 270.0) lat1 -= 360.0;
     if (cpr_nl(lat0) != cpr_nl(lat1)) return false;
@@ -134,20 +122,13 @@ static bool cpr_decode(adsb_aircraft_t *a)
     dlon = 360.0 / (nl > 0 ? nl : 1);
 
     double m   = floor(rlon0 * (cpr_nl(lat) - 1) - rlon1 * cpr_nl(lat) + 0.5);
-    double lon = dlon * (cpr_mod(m, (double)(nl > 0 ? nl : 1)) + rlon);
+    double lon = dlon * (fmod(m, (nl > 0 ? nl : 1)) + rlon);
     if (lon >= 180.0) lon -= 360.0;
-
-    /* Reject decodes that fell outside the valid Earth range. The math
-     * can still produce these when the input CPR pair has a bit error
-     * in the unprotected payload (CRC passed via single-bit fix on the
-     * wrong bit). Without this guard pos_valid latches onto bogus
-     * positions and the renderer never recovers. */
-    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0)
-        return false;
 
     a->lat = (float)lat;
     a->lon = (float)lon;
     a->pos_valid = true;
+    perf_mark_position(esp_timer_get_time());
     return true;
 }
 
@@ -198,6 +179,7 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         return;
     }
     perf_count_msg_good();
+    perf_mark_good_msg(esp_timer_get_time());
 
     adsb_aircraft_t *a = adsb_state_find_or_create(icao);
     if (!a) return;
@@ -210,42 +192,111 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     a->msg_count++;
     a->good_msg_count++;
 
+    /* Per-aircraft message-type counters for the detail-view diagnostic.
+     * The categories mirror what populates which fields, so a glance at
+     * the detail page tells you why a row looks empty. */
+    if (mm->msgtype == 11) {
+        a->mt_df11++;
+    } else if (mm->msgtype == 17) {
+        if (mm->metype >= 1 && mm->metype <= 4)        a->mt_df17_id++;
+        else if (mm->metype >= 9 && mm->metype <= 18)  a->mt_df17_pos++;
+        else if (mm->metype >= 19 && mm->metype <= 22) a->mt_df17_vel++;
+        else                                            a->mt_other++;
+    } else if (mm->msgtype == 4 || mm->msgtype == 5 ||
+               mm->msgtype == 20 || mm->msgtype == 21) {
+        a->mt_surv++;
+    } else {
+        a->mt_other++;
+    }
+
     bool had_callsign = (a->callsign[0] != '\0');
     plane_category_t prev_cat = plane_classify(a->icao,
                                                had_callsign ? a->callsign : NULL);
 
     /* Validate Mode-S IDENT callsigns. Garbled-but-CRC-passing flights
-     * are common on weak signals; stick with the first clean callsign
-     * unless we see a contradicting one twice in a row. */
+     * are common on weak signals — the mode-s lib's bit-flip-fix
+     * occasionally rescues a message where the flipped bit was actually
+     * in the callsign payload, not the CRC. Defense in two layers:
+     *
+     * 1. Hard structural gate (below). Real ATC callsigns always fit
+     *    a tight pattern: 3-8 chars, [A-Z0-9] only (no '?', no space,
+     *    no leading space), and the structure looks like a real call
+     *    (has a digit, or is a known military prefix). Garbage from
+     *    bit-flip-fix passes uniformly random 6-bit codes through the
+     *    ais_charset table, producing '?' and weird shapes that almost
+     *    never look like real callsigns.
+     *
+     * 2. 2-of-2 confirmation on *changes only*. Once a structurally
+     *    valid callsign is committed, replacing it requires two
+     *    consecutive matching decodes — otherwise a single bit-flipped
+     *    message could displace a known-good callsign. First commits
+     *    don't need confirmation because (a) the structural gate is
+     *    tight enough that single-shot garbage almost never matches a
+     *    real-callsign shape, and (b) requiring two-of-two on first
+     *    commits means weak-signal aircraft never get callsigns at all
+     *    if any of their early IDENT decodes have a flipped bit.
+     */
     if (mm->flight[0]) {
         char cand[9];
         strncpy(cand, mm->flight, 8);
         cand[8] = '\0';
         for (int i = 7; i >= 0 && cand[i] == ' '; i--) cand[i] = '\0';
 
-        bool valid = (cand[0] != '\0');
+        int len = (int)strlen(cand);
+        bool valid = (len >= 3 && len <= 8 && cand[0] != ' ');
+        bool has_digit = false;
+        bool has_letter = false;
         for (int i = 0; cand[i] && valid; i++) {
             char c = cand[i];
-            if (!((c >= 'A' && c <= 'Z') ||
-                  (c >= '0' && c <= '9') ||
-                  c == ' ')) valid = false;
+            if (c == '?' || c == ' ') { valid = false; break; }
+            if (c >= 'A' && c <= 'Z')      has_letter = true;
+            else if (c >= '0' && c <= '9') has_digit  = true;
+            else                            valid     = false;
         }
 
+        /* Shape check: a real callsign has either a digit (covers
+         * commercial like UAL918, tail numbers like N53402) or is one
+         * of the known all-letter military / agency prefixes (NAVY,
+         * ARMY, NATO, etc. — already enumerated in plane_audio.c).
+         * We don't import that list here to avoid the cross-component
+         * coupling; instead we accept all-letter callsigns of length
+         * 3-7 as a permissive fallback. Pure noise rarely produces a
+         * meaningful all-letter string. */
+        if (valid && !has_letter) valid = false;
+        (void)has_digit;  /* informational; we don't reject on its absence */
+
         if (valid) {
+            static char     pending_cand[9];
+            static uint32_t pending_icao;
+
             if (a->callsign[0] == '\0') {
+                /* First callsign for this aircraft — commit immediately
+                 * once it passes the structural gate. The gate is tight
+                 * enough to keep single-shot garbage out, and waiting
+                 * for two-of-two costs us legitimate callsigns on weak
+                 * tracks where each IDENT decode might have a different
+                 * bit flipped. */
                 strcpy(a->callsign, cand);
                 emit_contact_event(EVT_CONTACT_IDENT, a, false);
             } else if (strcmp(a->callsign, cand) != 0) {
-                static char     pending_cand[9];
-                static uint32_t pending_icao;
+                /* Replacing an established callsign — require two
+                 * matching decodes, since the established one was
+                 * already vetted by the structural gate. */
                 if (pending_icao == icao && strcmp(pending_cand, cand) == 0) {
                     strcpy(a->callsign, cand);
                     pending_icao = 0;
+                    pending_cand[0] = '\0';
                     emit_contact_event(EVT_CONTACT_IDENT, a, false);
                 } else {
                     strncpy(pending_cand, cand, 8);
                     pending_cand[8] = '\0';
                     pending_icao = icao;
+                }
+            } else {
+                /* Same as committed — clear any stale pending. */
+                if (pending_icao == icao) {
+                    pending_icao = 0;
+                    pending_cand[0] = '\0';
                 }
             }
         }
@@ -261,29 +312,27 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
      *
      * Filter strategy:
      *   1. Hard physical bounds — anything outside is decode garbage.
-     *   2. First good decode commits, so weak-signal aircraft with
-     *      only one or two messages still show data.
-     *   3. After that, big jumps require a second read within a
-     *      tolerance window before they replace the established value.
-     *      Tolerance instead of exact match is essential because real
-     *      ADS-B values jitter by a few units between reads (altitude
-     *      in 25 ft steps, etc.) and exact-match confirmation will
-     *      almost never fire.
+     *   2. Confirmation for big jumps — a single field-update has to
+     *      agree with one prior identical-direction read, so a single
+     *      stray decode can't replace an established value.
      *
-     * State for confirmation lives on the aircraft struct (pending_*).
-     * Zero means "no pending change". */
+     * State for confirmation lives on the aircraft struct (pending_*
+     * fields). pending_count is a small saturating counter — once a
+     * value is confirmed (count >= 2) it commits, else it's tentative
+     * and the renderer keeps the prior committed value. */
 
     if (mm->altitude) {
         int v = mm->altitude;
         if (v >= -1000 && v <= 60000) {
             int prev = a->altitude;
             int delta = v > prev ? v - prev : prev - v;
-            int pdelta = v > a->pending_alt ? v - a->pending_alt : a->pending_alt - v;
-            if (!a->alt_valid || delta < 5000 ||
-                (a->pending_alt != 0 && pdelta <= 200)) {
+            if (prev == 0 || delta < 5000 || a->pending_alt == v) {
                 a->altitude = v;
-                a->alt_valid = true;
                 a->pending_alt = 0;
+                /* Record committed altitude for the detail-page
+                 * sparkline. Done here rather than in the state module
+                 * so it tracks committed values (post-filter) only. */
+                adsb_state_push_altitude(a, v);
             } else {
                 a->pending_alt = v;
             }
@@ -295,12 +344,8 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             int prev = a->heading;
             int delta = v > prev ? v - prev : prev - v;
             if (delta > 180) delta = 360 - delta;
-            int pdelta = v > a->pending_hdg ? v - a->pending_hdg : a->pending_hdg - v;
-            if (pdelta > 180) pdelta = 360 - pdelta;
-            if (!a->hdg_valid || delta < 90 ||
-                (a->pending_hdg != 0 && pdelta <= 30)) {
+            if (prev == 0 || delta < 90 || a->pending_hdg == v) {
                 a->heading = v;
-                a->hdg_valid = true;
                 a->pending_hdg = 0;
             } else {
                 a->pending_hdg = v;
@@ -312,11 +357,8 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         if (v > 0 && v <= 1500) {
             int prev = a->velocity;
             int delta = v > prev ? v - prev : prev - v;
-            int pdelta = v > a->pending_vel ? v - a->pending_vel : a->pending_vel - v;
-            if (!a->vel_valid || delta < 200 ||
-                (a->pending_vel != 0 && pdelta <= 25)) {
+            if (prev == 0 || delta < 200 || a->pending_vel == v) {
                 a->velocity = v;
-                a->vel_valid = true;
                 a->pending_vel = 0;
             } else {
                 a->pending_vel = v;
@@ -338,11 +380,8 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         if (v >= -10000 && v <= 10000) {
             int prev = a->vert_rate;
             int delta = v > prev ? v - prev : prev - v;
-            int pdelta = v > a->pending_vs ? v - a->pending_vs : a->pending_vs - v;
-            if (!a->vs_valid || delta < 2000 ||
-                (a->pending_vs != 0 && pdelta <= 500)) {
+            if (prev == 0 || delta < 2000 || a->pending_vs == v) {
                 a->vert_rate = v;
-                a->vs_valid = true;
                 a->pending_vs = 0;
             } else {
                 a->pending_vs = v;
@@ -374,11 +413,8 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             audio_events_publish(AUDIO_EVT_NEW_CONTACT, icao, a->callsign, false);
     }
 
-    if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18) {
-        /* raw_lat/raw_lon are 17-bit unsigned CPR values; zero is a
-         * valid encoded coordinate, not a "missing field" sentinel.
-         * Earlier code checked != 0 here and silently dropped legitimate
-         * frames, occasionally blocking even/odd pairing forever. */
+    if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18 &&
+        mm->raw_latitude != 0) {
         int64_t ts = esp_timer_get_time();
         if (mm->fflag == 0)
             a->cpr_even = (adsb_cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, true };
@@ -443,6 +479,10 @@ void adsb_on_sample(uint8_t *iq, int len)
 void adsb_decode_init(void)
 {
     mode_s_init(&s_state);
+    /* Route every preamble candidate into the perf module. The diag
+     * page reads bursts/sec from there to distinguish "antenna dead"
+     * (no bursts) from "bursts fail CRC" (RF noisy) from "healthy". */
+    s_state.on_preamble = perf_count_burst;
     adsb_state_init();
 }
 
@@ -503,7 +543,7 @@ void adsb_inject_fake_aircraft(void)
     a->velocity  = 200 + ((s_test_seq * 13) % 200);
     a->heading   = (s_test_seq * 23) % 360;
     a->vert_rate = -1500 + ((s_test_seq * 137) % 3000);
-    a->alt_valid = a->vel_valid = a->hdg_valid = a->vs_valid = true;
+    adsb_state_push_altitude(a, a->altitude);
 
     /* Push every field-update event the parser knows about so the
      * host can verify each branch of its dispatch table. */

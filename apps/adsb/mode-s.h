@@ -20,6 +20,13 @@ typedef struct
     int fix_errors; // Single bit error correction if true
     int aggressive; // Aggressive detection algorithm
     int check_crc;  // Only display messages with good CRC
+
+    /* Optional hook fired once per preamble candidate that passes the
+     * pattern + threshold filters in mode_s_detect, regardless of
+     * whether the message later CRCs. NULL = no callback. The host uses
+     * this to maintain a "preamble candidates per second" counter for
+     * SNR diagnostics. */
+    void (*on_preamble)(void);
 } mode_s_t;
 
 // The struct we use to store information about a decoded message

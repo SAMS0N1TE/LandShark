@@ -19,6 +19,7 @@ void mode_s_init(mode_s_t *self)
     self->fix_errors = 1;
     self->check_crc = 1;
     self->aggressive = 0;
+    self->on_preamble = NULL;
 
     // Allocate the ICAO address cache. We use two uint32_t for every entry
     // because it's a addr / timestamp pair for every entry
@@ -708,6 +709,9 @@ void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callba
         }
 
     good_preamble:
+        // Bump the burst counter exactly once per candidate. Retries
+        // arrive here with use_correction=1 and must not double-count.
+        if (!use_correction && self->on_preamble) self->on_preamble();
         // If the previous attempt with this message failed, retry using
         // magnitude correction.
         if (use_correction)
