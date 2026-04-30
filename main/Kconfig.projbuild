@@ -80,6 +80,33 @@ menu "ESP32-P4 SDR Tool"
                 using an RTL-SDR dongle. Decodes ICAO, callsign, altitude,
                 velocity, heading, vertical rate, and CPR position pairs.
 
+        config ADSB_RX_LAT_UDEG
+            int "Receiver latitude (microdegrees)"
+            depends on APP_ADSB
+            default 0
+            range -90000000 90000000
+            help
+                Latitude of the receiver in microdegrees (degrees * 1e6).
+                Example: Laconia NH (43.5275 N) = 43527500.
+                When set (non-zero), enables locally-unambiguous CPR
+                decoding from the very first position frame, instead of
+                waiting for an even/odd pair. Aircraft that send only one
+                or two position squitters before drifting out of range
+                will now produce a position fix.
+                Leave at 0 to disable receiver-anchored local decoding;
+                the firmware still does global decoding (even+odd pair)
+                and per-aircraft local decoding from prior fixes.
+
+        config ADSB_RX_LON_UDEG
+            int "Receiver longitude (microdegrees)"
+            depends on APP_ADSB
+            default 0
+            range -180000000 180000000
+            help
+                Longitude of the receiver in microdegrees (degrees * 1e6).
+                Example: Laconia NH (71.5375 W) = -71537500. Negative for
+                West, positive for East. See ADSB_RX_LAT_UDEG.
+
         config APP_VHF
             bool "VHF FM (scaffold)"
             default n

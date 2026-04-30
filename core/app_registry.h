@@ -33,6 +33,7 @@ typedef enum {
     PAGE_SIGNAL,           /* per-app signal/spectrum view (was WATERFALL) */
     PAGE_LOG,
     PAGE_SETTINGS,
+    PAGE_DIAG,             /* per-app radio/decode diagnostics */
     PAGE_COUNT
 } page_t;
 
@@ -58,6 +59,8 @@ typedef struct app_s {
     const char *banner;
     /* Optional: short label for the SIGNAL tab. NULL -> "SIGNAL". */
     const char *signal_label;
+    /* Optional: short label for the DIAG tab. NULL -> "DIAG". */
+    const char *diag_label;
 
     void (*on_enter)(void);
     void (*on_exit) (void);
@@ -66,6 +69,9 @@ typedef struct app_s {
     /* Optional: replace the default Mode-S-style signal analyzer on
      * PAGE_SIGNAL. NULL -> framework draws its built-in spectrum view. */
     void (*draw_signal)(int top_row, int rows, int cols);
+    /* Optional: render a radio/decode diagnostic page. NULL -> empty
+     * page with a "no diagnostics for this app" placeholder. */
+    void (*draw_diag)(int top_row, int rows, int cols);
     void (*on_key)(tui_key_t k);
 } app_t;
 

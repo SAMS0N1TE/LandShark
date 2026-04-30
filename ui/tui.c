@@ -200,15 +200,15 @@ static void draw_header(void)
 /* -- page tab bar at row 3 ------------------------------------------- */
 static void draw_page_tabs(void)
 {
-    /* Page names: tab 2 ("SIGNAL") gets relabeled per-app via the
-     * signal_label field, so on ADS-B it reads "MODE-S" (Mode-S signal
-     * analyzer) and on P25 it reads "DEMOD" (P25 demod focus page).
-     * The other three are framework-owned and stay constant. */
+    /* Page names: tabs 2 and 5 are app-relabelable via signal_label /
+     * diag_label. Other tabs are framework-owned. */
     const app_t *cur_app = app_current();
     const char *sig_label =
         (cur_app && cur_app->signal_label) ? cur_app->signal_label : "SIGNAL";
+    const char *diag_label =
+        (cur_app && cur_app->diag_label)   ? cur_app->diag_label   : "DIAG";
     const char *page_names[PAGE_COUNT] = {
-        "MAIN", sig_label, "LOG", "SETTINGS"
+        "MAIN", sig_label, "LOG", "SETTINGS", diag_label
     };
     page_t cur = page_current();
 
@@ -864,7 +864,7 @@ static void draw_footer(void)
     /* Help line just above. */
     tui_goto(row - 1, 1);
     printf(C_BORDER VL RESET);
-    printf(C_DIM " [1-4] page  [Tab] cycle  [A] app" RESET
+    printf(C_DIM " [1-5] page  [Tab] cycle  [A] app" RESET
            C_DIM "  |  [M]ute [+/-] vol  [V]oice [C][L][P][B]" RESET
            C_DIM "  |  [ctrl-]] exit" RESET EL);
     tui_goto(row - 1, TUI_COLS);
@@ -949,6 +949,22 @@ void tui_draw(void)
     }
     case PAGE_LOG:       draw_page_log(body_top, body_rows, TUI_COLS - 4); break;
     case PAGE_SETTINGS:  draw_page_settings(body_top, body_rows, TUI_COLS - 4); break;
+    case PAGE_DIAG: {
+        /* Per-app diagnostic view. Apps that don't provide one get a
+         * placeholder rather than nothing — easier to understand than
+         * a blank page when switching apps. */
+        const app_t *a = app_current();
+        if (a && a->draw_diag) {
+            a->draw_diag(body_top, body_rows, TUI_COLS - 4);
+        } else {
+            for (int r = body_top; r < body_top + body_rows; r++) {
+                tui_goto(r, 3); fputs(EL, stdout);
+            }
+            tui_goto(body_top + body_rows / 2, (TUI_COLS - 30) / 2);
+            printf(C_DIM "(no diagnostics for this app)" RESET);
+        }
+        break;
+    }
     default: break;
     }
 

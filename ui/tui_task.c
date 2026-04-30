@@ -35,6 +35,7 @@ static bool dispatch_key(tui_key_t raw)
     case '2': page_set(PAGE_SIGNAL);    tui_mark_dirty(); return true;
     case '3': page_set(PAGE_LOG);       tui_mark_dirty(); return true;
     case '4': page_set(PAGE_SETTINGS);  tui_mark_dirty(); return true;
+    case '5': page_set(PAGE_DIAG);      tui_mark_dirty(); return true;
     case TK_TAB: page_cycle_next();     tui_mark_dirty(); return true;
     case 'a': case 'A':
         app_cycle_next();
